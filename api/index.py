@@ -46,16 +46,22 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_recent_expenses",
-            "description": "Get site expenses for a project or all projects.",
+            "description": "Get recent site expenses. The limit must be a whole number.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "default": 5}
-                }
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of expenses to return, e.g. 5 or 10.",
+                        "minimum": 1,
+                        "maximum": 50
+                    }
+                },
+                "required": []
             }
         }
     }
-]
+    ]
 
 def execute_tool(name, args):
     if name == "get_project_summary":
@@ -85,8 +91,13 @@ def execute_tool(name, args):
 
     elif name == "get_recent_expenses":
         limit = args.get("limit", 5)
-        res = supabase.table("expenses").select("category, amount, payment_mode, vendor_or_recipient, expense_date").order("expense_date", desc=True).limit(limit).execute()
-        return json.dumps(res.data or [])
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 5
+
+        limit = max(1, min(limit, 50))
     
     return json.dumps({"error": "Unknown tool function."})
 
