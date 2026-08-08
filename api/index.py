@@ -162,7 +162,7 @@ def process_whatsapp_message(from_number, incoming_msg):
             logging.exception("Failed to write error or send message")
         return False
 
-@app.route("/webhook/whatsapp", methods=["GET", "POST"])
+@app.route("/webhook/whatsapp", methods=["GET", "POST"],strict_slashes=False)
 def whatsapp_webhook():
     if request.method == "GET":
         return "WhatsApp Webhook Endpoint is Active!", 200
