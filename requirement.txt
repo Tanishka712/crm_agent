@@ -1,0 +1,10 @@
+flask
+twilio
+supabase
+groq
+pandas
+scikit-learn
+plotly
+streamlit
+gunicorn
+python-dotenv
