@@ -1,2 +1,20 @@
-.vercel
-.env*
+# Environment variables (SECRETS)
+.env
+.env.*
+.env.local
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Vercel Build Output
+.vercel/
+
+# Python cache & bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
