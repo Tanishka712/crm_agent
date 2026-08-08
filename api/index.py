@@ -151,7 +151,10 @@ def process_whatsapp_message(from_number, incoming_msg):
         twilio_client.messages.create(
             from_=os.getenv("TWILIO_WHATSAPP_NUMBER"),
             to=from_number,
-            body=reply_text
+            content_sid=os.getenv("TWILIO_CONTENT_SID"),
+            content_variables=json.dumps({
+                "1": reply_text
+            })
         )
         return True
 
