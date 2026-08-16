@@ -178,8 +178,19 @@ def send_whatsapp_message(to, message):
         "text": {"body": message}
     }
 
+    masked_recipient = str(to)[:4] + "***" if to else "unknown"
+    masked_phone_id = str(META_PHONE_NUMBER_ID)[:4] + "***" if META_PHONE_NUMBER_ID else "unknown"
+
+    logger.info("[META] Sending response to: %s", masked_recipient)
+    logger.info("[META] Sending WhatsApp text response")
+    logger.info("[META] phone_number_id = %s", masked_phone_id)
+    logger.info("[META] recipient = %s", masked_recipient)
+    logger.info("[META] message_type = text")
+
     logger.info("[PIPELINE] Meta HTTP POST to graph.facebook.com (timeout=30s)")
     response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    print("[PIPELINE] Meta response body:", response.text)
     logger.info("[PIPELINE] Meta send-message response: HTTP %s", response.status_code)
 
     if not response.ok:
@@ -190,7 +201,19 @@ def send_whatsapp_message(to, message):
         )
         response.raise_for_status()
 
-    return response.json()
+    try:
+        resp_json = response.json()
+        messages_resp = resp_json.get("messages", [])
+        if messages_resp and "id" in messages_resp[0]:
+            wamid = messages_resp[0]["id"]
+            logger.info("[META] Message accepted by Meta")
+            logger.info("[META] WhatsApp message ID: %s", wamid)
+        else:
+            logger.info("[META] Message accepted by Meta, response: %s", response.text)
+        return resp_json
+    except Exception:
+        logger.info("[META] Response body: %s", response.text)
+        return response.json()
 
 # ---------------------------------------------------------------------------
 # AI agent processing
