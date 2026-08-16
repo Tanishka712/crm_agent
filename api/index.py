@@ -332,6 +332,7 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     logger.info("[PIPELINE] ── START id=%s from=%s*** ──", message_id, str(sender_id)[:4])
 
     print("[PIPELINE] Extracted message text", flush=True)
+    logger.info("[INPUT DEBUG] text=%s", incoming_msg)
     logger.info("[PIPELINE] Extracted message text (len=%d)", len(incoming_msg))
     logger.info("[PIPELINE] Sender ID prefix: %s***", str(sender_id)[:4])
 
@@ -362,31 +363,52 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             .execute()
         )
         print("[PIPELINE] Stage 2 completed", flush=True)
-        logger.info("[PIPELINE] Stage 2 completed — CRM lookup completed, rows=%d",
-                    len(history_res.data or []))
+        raw_history = history_res.data or []
+        logger.info("[PIPELINE] Stage 2 completed — CRM lookup completed, rows=%d", len(raw_history))
     except Exception as e:
         print("[PIPELINE] Stage 2 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 2 FAILED — Supabase history fetch error")
-        history_res = type("R", (), {"data": []})()
+        raw_history = []
+
+    # Build clean alternating history list (chronological order)
+    chronological_history = list(reversed(raw_history))
+    cleaned_history = []
+    for h in chronological_history:
+        role = h.get("role")
+        content = h.get("message_text", "").strip()
+        if role in ("user", "assistant") and content:
+            # Avoid consecutive duplicate messages of the same role in history
+            if cleaned_history and cleaned_history[-1]["role"] == role and cleaned_history[-1]["content"] == content:
+                continue
+            cleaned_history.append({"role": role, "content": content})
+
+    # If the last item in history is a user message, drop it so it doesn't collide with the current incoming user turn
+    if cleaned_history and cleaned_history[-1]["role"] == "user":
+        cleaned_history.pop()
+
+    last_role = cleaned_history[-1]["role"] if cleaned_history else "none"
+    last_msg_snippet = cleaned_history[-1]["content"][:60] if cleaned_history else "none"
+
+    logger.info("[LLM DEBUG] current_message=%s", incoming_msg)
+    logger.info("[LLM DEBUG] history_count=%d", len(cleaned_history))
+    logger.info("[LLM DEBUG] history_last_role=%s", last_role)
+    logger.info("[LLM DEBUG] history_last_message=%s", last_msg_snippet)
 
     # Build message list for LLM
     messages = [
         {
             "role": "system",
             "content": (
-                "You are an intelligent construction field ops assistant. "
-                "Answer queries concisely for WhatsApp output. "
-                "Use bold formatting where appropriate. "
-                "Always use the available database tools to fetch accurate real-time data. "
-                "Never invent, hallucinate, or assume progress metrics, meter counts, costs, or notes that are not returned by the database tools. "
-                "If data is not found in the database, clearly state that no records exist."
+                "You are an intelligent construction field ops assistant. Answer queries concisely for WhatsApp output. Use bold formatting where appropriate.\n\n"
+                "CRITICAL RULES:\n"
+                "1. For greetings, pleasantries, or general conversational openers (e.g., 'Hello', 'Hi', 'Hey', 'Help', 'Who are you?'), respond politely and warmly WITHOUT calling any database tools.\n"
+                "2. Call database tools ONLY when the user's CURRENT message specifically asks for data regarding construction projects, daily site progress, logs, trenching, pipes, equipment, or expenses.\n"
+                "3. Base your answers strictly on the facts returned by the database tools. Never invent, hallucinate, or assume metrics, numbers, or notes."
             )
         }
     ]
-    for h in reversed(history_res.data or []):
-        if h["role"] in ("user", "assistant"):
-            messages.append({"role": h["role"], "content": h["message_text"]})
+    messages.extend(cleaned_history)
     messages.append({"role": "user", "content": incoming_msg})
     logger.info("[PIPELINE] LLM context built: %d message(s) (incl. system)", len(messages))
 
@@ -443,13 +465,15 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         return False
 
     msg_obj = response.choices[0].message
-    logger.info("[TOOL DEBUG] tool_calls=%s", str(bool(msg_obj.tool_calls)).lower())
+    has_tool_calls = bool(msg_obj.tool_calls)
+    logger.info("[TOOL DEBUG] called=%s", str(has_tool_calls).lower())
+    logger.info("[TOOL DEBUG] tool_calls=%s", str(has_tool_calls).lower())
     logger.info("[PIPELINE] Stage 5 — finish_reason=%s tool_calls=%s",
                 response.choices[0].finish_reason,
-                bool(msg_obj.tool_calls))
+                has_tool_calls)
 
     # ── Stage 6: Tool execution (if requested) ────────────────────────────────
-    if msg_obj.tool_calls:
+    if has_tool_calls:
         print("[PIPELINE] Stage 6 starting", flush=True)
         logger.info("[PIPELINE] Stage 6 starting")
         tool_names = [tc.function.name for tc in msg_obj.tool_calls]
@@ -481,6 +505,7 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                 tool_args = {}
 
             logger.info("[TOOL DEBUG] name=%s", tool_name)
+            logger.info("[TOOL DEBUG] reason=model requested execution for query: %s", incoming_msg[:40])
             logger.info("[TOOL DEBUG] arguments=%s", tool_args)
             logger.info("[PIPELINE] Stage 6 — Executing tool: %s", tool_name)
             try:
