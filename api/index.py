@@ -70,6 +70,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_projects",
+            "description": "Fetch the list of construction projects from the database (including project name, location, and status). Use this whenever the user asks about active projects, ongoing projects, project list, or what projects exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Optional status filter (e.g. 'Active'). If omitted, returns all projects."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_project_summary",
             "description": "Fetch overall progress totals, total expenses, and equipment stats for a given project name.",
             "parameters": {
@@ -138,7 +155,27 @@ TOOLS = [
 def execute_tool(name, args):
     supabase = get_supabase()
 
-    if name == "get_project_summary":
+    if name == "get_projects":
+        status = args.get("status")
+        try:
+            query = supabase.table("projects").select("project_name, location, status")
+            if status:
+                query = query.ilike("status", f"%{status}%")
+            res = query.order("created_at", desc=False).execute()
+            rows = res.data or []
+            logger.info(
+                "[DB TEST] tool=get_projects status=%s rows=%d rows_data=%s result_passed_to_llm=true",
+                status or "All", len(rows), rows
+            )
+            return json.dumps({
+                "projects": rows,
+                "count": len(rows)
+            })
+        except Exception:
+            logger.exception("Supabase error in get_projects")
+            return json.dumps({"error": "Database error fetching projects."})
+
+    elif name == "get_project_summary":
         p_name = args.get("project_name")
         try:
             res = supabase.table("projects").select("*").ilike("project_name", f"%{p_name}%").execute()
@@ -147,7 +184,7 @@ def execute_tool(name, args):
             return json.dumps({"error": "Database error fetching project."})
 
         if not res.data:
-            logger.info("[DB TEST] tool=get_project_summary project=%s rows=0 returned_keys=[] result_passed_to_llm=true", p_name)
+            logger.info("[DB TEST] tool=get_project_summary project=%s rows=0 rows_data=[] result_passed_to_llm=true", p_name)
             return json.dumps({"error": f"No project found matching '{p_name}'"})
 
         project_id = res.data[0]["id"]
@@ -174,8 +211,8 @@ def execute_tool(name, args):
             "total_daily_logs_count": len(logs)
         }
         logger.info(
-            "[DB TEST] tool=get_project_summary project=%s rows=%d returned_keys=%s result_passed_to_llm=true",
-            p_real_name, len(logs), list(summary_data.keys())
+            "[DB TEST] tool=get_project_summary project=%s rows=%d rows_data=%s result_passed_to_llm=true",
+            p_real_name, len(logs), summary_data
         )
         return json.dumps(summary_data)
 
@@ -196,7 +233,7 @@ def execute_tool(name, args):
             try:
                 p_res = supabase.table("projects").select("id, project_name").ilike("project_name", f"%{p_name}%").execute()
                 if not p_res.data:
-                    logger.info("[DB TEST] tool=get_daily_logs project=%s rows=0 returned_keys=[] result_passed_to_llm=true", p_name)
+                    logger.info("[DB TEST] tool=get_daily_logs project=%s rows=0 rows_data=[] result_passed_to_llm=true", p_name)
                     return json.dumps({"error": f"No project found matching '{p_name}'"})
                 pid = p_res.data[0]["id"]
                 project_matched = p_res.data[0]["project_name"]
@@ -208,10 +245,9 @@ def execute_tool(name, args):
         try:
             res = query.order("log_date", desc=True).limit(limit).execute()
             rows = res.data or []
-            sample_keys = list(rows[0].keys()) if rows else []
             logger.info(
-                "[DB TEST] tool=get_daily_logs project=%s rows=%d returned_keys=%s result_passed_to_llm=true",
-                project_matched or p_name or "All", len(rows), sample_keys
+                "[DB TEST] tool=get_daily_logs project=%s rows=%d rows_data=%s result_passed_to_llm=true",
+                project_matched or p_name or "All", len(rows), rows
             )
             return json.dumps({
                 "project_name": project_matched or "All Projects",
@@ -238,7 +274,7 @@ def execute_tool(name, args):
             try:
                 p_res = supabase.table("projects").select("id, project_name").ilike("project_name", f"%{p_name}%").execute()
                 if not p_res.data:
-                    logger.info("[DB TEST] tool=get_recent_expenses project=%s rows=0 returned_keys=[] result_passed_to_llm=true", p_name)
+                    logger.info("[DB TEST] tool=get_recent_expenses project=%s rows=0 rows_data=[] result_passed_to_llm=true", p_name)
                     return json.dumps({"error": f"No project found matching '{p_name}'"})
                 pid = p_res.data[0]["id"]
                 project_matched = p_res.data[0]["project_name"]
@@ -250,10 +286,9 @@ def execute_tool(name, args):
         try:
             res = query.order("expense_date", desc=True).limit(limit).execute()
             rows = res.data or []
-            sample_keys = list(rows[0].keys()) if rows else []
             logger.info(
-                "[DB TEST] tool=get_recent_expenses project=%s rows=%d returned_keys=%s result_passed_to_llm=true",
-                project_matched or p_name or "All", len(rows), sample_keys
+                "[DB TEST] tool=get_recent_expenses project=%s rows=%d rows_data=%s result_passed_to_llm=true",
+                project_matched or p_name or "All", len(rows), rows
             )
             return json.dumps({
                 "project_name": project_matched or "All Projects",
@@ -401,10 +436,11 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             "role": "system",
             "content": (
                 "You are an intelligent construction field ops assistant. Answer queries concisely for WhatsApp output. Use bold formatting where appropriate.\n\n"
-                "CRITICAL RULES:\n"
-                "1. For greetings, pleasantries, or general conversational openers (e.g., 'Hello', 'Hi', 'Hey', 'Help', 'Who are you?'), respond politely and warmly WITHOUT calling any database tools.\n"
-                "2. Call database tools ONLY when the user's CURRENT message specifically asks for data regarding construction projects, daily site progress, logs, trenching, pipes, equipment, or expenses.\n"
-                "3. Base your answers strictly on the facts returned by the database tools. Never invent, hallucinate, or assume metrics, numbers, or notes."
+                "CRITICAL GROUNDING RULES:\n"
+                "1. For greetings, pleasantries, or general conversational openers (e.g. 'Hello', 'Hi', 'Hey', 'Help', 'Who are you?'), respond politely and warmly WITHOUT calling any database tools.\n"
+                "2. When the user asks about projects (e.g. 'What are my active projects?', 'List projects', 'ongoing projects'), daily progress, site logs, or expenses, ALWAYS invoke the appropriate database tool to query Supabase.\n"
+                "3. Your final answer MUST be strictly and exclusively grounded in the data returned by the database tools. NEVER invent, assume, or hallucinate project names, locations, metrics, or expenses (e.g., only mention projects returned in the tool response).\n"
+                "4. If a tool returns 0 projects or 0 records, clearly state 'No active projects found.' or 'No records exist.' Never make up fictitious project names or data."
             )
         }
     ]
