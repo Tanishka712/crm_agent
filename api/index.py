@@ -178,21 +178,17 @@ def send_whatsapp_message(to, message):
         "text": {"body": message}
     }
 
-    logger.info("Sending WhatsApp message to %s***", str(to)[:4])
+    logger.info("[PIPELINE] Meta HTTP POST to graph.facebook.com (timeout=30s)")
     response = requests.post(url, headers=headers, json=payload, timeout=30)
+    logger.info("[PIPELINE] Meta send-message response: HTTP %s", response.status_code)
 
-    # Log status without exposing the token
-    logger.info("Meta send-message response: HTTP %s", response.status_code)
-
-    try:
-        response.raise_for_status()
-    except requests.exceptions.HTTPError:
+    if not response.ok:
         logger.error(
-            "Meta send-message HTTP error: status=%s body=%s",
+            "[PIPELINE] Meta send-message HTTP error: status=%s body=%s",
             response.status_code,
-            response.text[:500]
+            response.text[:500]   # truncated — never contains the token
         )
-        raise
+        response.raise_for_status()
 
     return response.json()
 
@@ -201,11 +197,22 @@ def send_whatsapp_message(to, message):
 # ---------------------------------------------------------------------------
 def process_whatsapp_message(sender_id, incoming_msg, message_id):
     """Run the incoming message through the Groq AI agent and reply via Meta."""
-    logger.info("[PIPELINE] Processing message id=%s from=%s***", message_id, str(sender_id)[:4])
+    logger.info("[PIPELINE] ── START id=%s from=%s*** ──", message_id, str(sender_id)[:4])
+    logger.info("[PIPELINE] Extracted message text (len=%d)", len(incoming_msg))
+    logger.info("[PIPELINE] Sender ID prefix: %s***", str(sender_id)[:4])
 
-    supabase = get_supabase()
+    # ── Stage 1: Supabase client init ────────────────────────────────────────
+    logger.info("[PIPELINE] Stage 1 — Initialising Supabase client")
+    try:
+        supabase = get_supabase()
+        logger.info("[PIPELINE] Stage 1 — Supabase client OK")
+    except Exception:
+        logger.exception("[PIPELINE] Stage 1 FAILED — could not create Supabase client")
+        _send_error_reply(sender_id)
+        return False
 
-    # Fetch conversation history
+    # ── Stage 2: CRM history lookup ───────────────────────────────────────────
+    logger.info("[PIPELINE] Stage 2 — Starting CRM history lookup")
     try:
         history_res = (
             supabase.table("chat_sessions")
@@ -215,10 +222,13 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             .limit(6)
             .execute()
         )
+        logger.info("[PIPELINE] Stage 2 — CRM lookup completed, rows=%d",
+                    len(history_res.data or []))
     except Exception:
-        logger.exception("[PIPELINE] Supabase error fetching chat history")
+        logger.exception("[PIPELINE] Stage 2 FAILED — Supabase history fetch error")
         history_res = type("R", (), {"data": []})()
 
+    # Build message list for LLM
     messages = [
         {
             "role": "system",
@@ -229,43 +239,61 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             )
         }
     ]
-
     for h in reversed(history_res.data or []):
         if h["role"] in ("user", "assistant"):
             messages.append({"role": h["role"], "content": h["message_text"]})
-
     messages.append({"role": "user", "content": incoming_msg})
+    logger.info("[PIPELINE] LLM context built: %d message(s) (incl. system)", len(messages))
 
-    # Persist user message
+    # ── Stage 3: Persist user message ────────────────────────────────────────
+    logger.info("[PIPELINE] Stage 3 — Persisting user message to Supabase")
     try:
         supabase.table("chat_sessions").insert({
             "whatsapp_number": sender_id,
             "role": "user",
             "message_text": incoming_msg
         }).execute()
+        logger.info("[PIPELINE] Stage 3 — User message persisted OK")
     except Exception:
-        logger.exception("[PIPELINE] Supabase error inserting user message")
+        logger.exception("[PIPELINE] Stage 3 FAILED — Supabase insert user message error")
+        # Non-fatal: continue even if logging to DB fails
 
-    # First Groq call (with tool support)
-    logger.info("[PIPELINE] Calling Groq LLM (first call)")
+    # ── Stage 4: Groq client init ─────────────────────────────────────────────
+    logger.info("[PIPELINE] Stage 4 — Initialising Groq client")
     try:
-        groq = get_groq()
-        response = groq.chat.completions.create(
+        groq_client = get_groq()
+        logger.info("[PIPELINE] Stage 4 — Groq client OK")
+    except Exception:
+        logger.exception("[PIPELINE] Stage 4 FAILED — could not create Groq client")
+        _send_error_reply(sender_id)
+        return False
+
+    # ── Stage 5: First LLM call ───────────────────────────────────────────────
+    logger.info("[PIPELINE] Stage 5 — Starting LLM call (model=%s, messages=%d)",
+                GROQ_MODEL, len(messages))
+    try:
+        response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto"
+            tool_choice="auto",
+            timeout=25  # seconds — prevents indefinite hang
         )
+        logger.info("[PIPELINE] Stage 5 — LLM call completed")
     except Exception:
-        logger.exception("[PIPELINE] Groq error on first completion call")
+        logger.exception("[PIPELINE] Stage 5 FAILED — Groq first LLM call error")
         _send_error_reply(sender_id)
         return False
 
     msg_obj = response.choices[0].message
+    logger.info("[PIPELINE] Stage 5 — finish_reason=%s tool_calls=%s",
+                response.choices[0].finish_reason,
+                bool(msg_obj.tool_calls))
 
+    # ── Stage 6: Tool execution (if requested) ────────────────────────────────
     if msg_obj.tool_calls:
-        logger.info("[PIPELINE] Tool calls requested: %s",
-                    [tc.function.name for tc in msg_obj.tool_calls])
+        tool_names = [tc.function.name for tc in msg_obj.tool_calls]
+        logger.info("[PIPELINE] Stage 6 — Tool calls requested: %s", tool_names)
 
         messages.append({
             "role": "assistant",
@@ -285,52 +313,72 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
 
         for tool_call in msg_obj.tool_calls:
             tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
-            logger.info("[PIPELINE] Executing tool: %s args=%s", tool_name, tool_args)
-            tool_output = execute_tool(tool_name, tool_args)
+            try:
+                tool_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                logger.error("[PIPELINE] Stage 6 — JSON decode error on tool args for %s",
+                             tool_name)
+                tool_args = {}
+
+            logger.info("[PIPELINE] Stage 6 — Executing tool: %s", tool_name)
+            try:
+                tool_output = execute_tool(tool_name, tool_args)
+                logger.info("[PIPELINE] Stage 6 — Tool %s completed, output_len=%d",
+                            tool_name, len(tool_output))
+            except Exception:
+                logger.exception("[PIPELINE] Stage 6 FAILED — tool %s raised exception",
+                                 tool_name)
+                tool_output = json.dumps({"error": "Tool execution failed."})
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": tool_output
             })
 
-        # Second Groq call (final answer)
-        logger.info("[PIPELINE] Calling Groq LLM (second call, after tools)")
+        # ── Stage 7: Second LLM call (final answer after tools) ───────────────
+        logger.info("[PIPELINE] Stage 7 — Starting second LLM call (after tools)")
         try:
-            groq = get_groq()
-            second_response = groq.chat.completions.create(
+            second_response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
-                messages=messages
+                messages=messages,
+                timeout=25
             )
             reply_text = second_response.choices[0].message.content
+            logger.info("[PIPELINE] Stage 7 — Second LLM call completed")
         except Exception:
-            logger.exception("[PIPELINE] Groq error on second completion call")
+            logger.exception("[PIPELINE] Stage 7 FAILED — Groq second LLM call error")
             _send_error_reply(sender_id)
             return False
     else:
+        logger.info("[PIPELINE] Stage 6 — No tool calls, using direct LLM answer")
         reply_text = msg_obj.content
 
-    logger.info("[PIPELINE] LLM response generated, length=%d chars", len(reply_text or ""))
+    logger.info("[PIPELINE] Generated response (len=%d chars)", len(reply_text or ""))
 
-    # Persist assistant reply
+    # ── Stage 8: Persist assistant reply ─────────────────────────────────────
+    logger.info("[PIPELINE] Stage 8 — Persisting assistant reply to Supabase")
     try:
         supabase.table("chat_sessions").insert({
             "whatsapp_number": sender_id,
             "role": "assistant",
             "message_text": reply_text
         }).execute()
+        logger.info("[PIPELINE] Stage 8 — Assistant reply persisted OK")
     except Exception:
-        logger.exception("[PIPELINE] Supabase error inserting assistant message")
+        logger.exception("[PIPELINE] Stage 8 FAILED — Supabase insert assistant message error")
+        # Non-fatal: still attempt to send the reply
 
-    # Send reply via Meta
-    logger.info("[PIPELINE] Sending WhatsApp response via Meta")
+    # ── Stage 9: Send reply via Meta ──────────────────────────────────────────
+    logger.info("[PIPELINE] Stage 9 — Starting Meta send")
     try:
         send_whatsapp_message(sender_id, reply_text)
-        logger.info("[PIPELINE] ✅ Message delivered successfully")
+        logger.info("[PIPELINE] Stage 9 — Meta send completed ✅")
     except Exception:
-        logger.exception("[PIPELINE] Meta send-message error — reply not delivered")
+        logger.exception("[PIPELINE] Stage 9 FAILED — Meta send-message error")
         return False
 
+    logger.info("[PIPELINE] ── END id=%s SUCCESS ──", message_id)
     return True
 
 
