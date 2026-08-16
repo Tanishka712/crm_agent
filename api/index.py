@@ -1,8 +1,7 @@
 import os
 import json
+import requests
 from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
 from supabase import create_client, Client as SupabaseClient
 from groq import Groq
 from dotenv import load_dotenv
@@ -11,22 +10,34 @@ import logging
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Initialize Clients
+# ---------------------------------------------------------------------------
+# Client initialisation
+# ---------------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# Meta WhatsApp Cloud API credentials (never hardcoded)
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
+META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID")
+META_WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("META_WHATSAPP_BUSINESS_ACCOUNT_ID")
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
+
+# Graph API version used consistently throughout
+META_GRAPH_API_VERSION = "v21.0"
 
 supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
 TOOLS = [
     {
         "type": "function",
@@ -36,7 +47,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string", "description": "The name of the project."}
+                    "project_name": {
+                        "type": "string",
+                        "description": "The name of the project."
+                    }
                 },
                 "required": ["project_name"]
             }
@@ -46,7 +60,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_recent_expenses",
-            "description": "Get recent site expenses. The limit must be a whole number.",
+            "description": "Get recent site expenses. The limit must be a whole number between 1 and 50.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -61,21 +75,33 @@ TOOLS = [
             }
         }
     }
-    ]
+]
 
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
 def execute_tool(name, args):
     if name == "get_project_summary":
         p_name = args.get("project_name")
-        res = supabase.table("projects").select("*").ilike("project_name", f"%{p_name}%").execute()
+        try:
+            res = supabase.table("projects").select("*").ilike("project_name", f"%{p_name}%").execute()
+        except Exception:
+            logger.exception("Supabase error in get_project_summary")
+            return json.dumps({"error": "Database error fetching project."})
+
         if not res.data:
             return json.dumps({"error": f"No project found matching '{p_name}'"})
-        
+
         project_id = res.data[0]["id"]
         p_real_name = res.data[0]["project_name"]
 
-        logs = supabase.table("daily_logs").select("*").eq("project_id", project_id).execute().data or []
-        expenses = supabase.table("expenses").select("*").eq("project_id", project_id).execute().data or []
-        equip = supabase.table("equipment_logs").select("*").eq("project_id", project_id).execute().data or []
+        try:
+            logs = supabase.table("daily_logs").select("*").eq("project_id", project_id).execute().data or []
+            expenses = supabase.table("expenses").select("*").eq("project_id", project_id).execute().data or []
+            equip = supabase.table("equipment_logs").select("*").eq("project_id", project_id).execute().data or []
+        except Exception:
+            logger.exception("Supabase error fetching project sub-tables")
+            return json.dumps({"error": "Database error fetching project details."})
 
         total_trenching = sum([l.get("trenching_meters", 0) or 0 for l in logs])
         total_pipe = sum([l.get("pipe_laid_meters", 0) or 0 for l in logs])
@@ -91,104 +117,288 @@ def execute_tool(name, args):
 
     elif name == "get_recent_expenses":
         limit = args.get("limit", 5)
-
+        # Robustly convert string/float to int in case LLM sends wrong type
         try:
             limit = int(limit)
         except (TypeError, ValueError):
             limit = 5
-
         limit = max(1, min(limit, 50))
-    
+
+        try:
+            res = supabase.table("expenses").select(
+                "category, amount, payment_mode, vendor_or_recipient, expense_date"
+            ).order("expense_date", desc=True).limit(limit).execute()
+        except Exception:
+            logger.exception("Supabase error in get_recent_expenses")
+            return json.dumps({"error": "Database error fetching expenses."})
+
+        return json.dumps(res.data)
+
     return json.dumps({"error": "Unknown tool function."})
 
-def process_whatsapp_message(from_number, incoming_msg):
+# ---------------------------------------------------------------------------
+# Meta WhatsApp Cloud API — send message
+# ---------------------------------------------------------------------------
+def send_whatsapp_message(to, message):
+    """Send a text message via Meta WhatsApp Cloud API (Graph API v21.0)."""
+    url = f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{META_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {
+            "body": message
+        }
+    }
     try:
-        logging.info("Processing WhatsApp message from %s", from_number)
-        history_res = supabase.table("chat_sessions").select("role, message_text").eq("whatsapp_number", from_number).order("created_at", desc=True).limit(6).execute()
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        logger.info("Meta send-message success to %s", to)
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        # Log status and safe response body — never log the access token
+        logger.error(
+            "Meta send-message HTTP error: status=%s body=%s",
+            e.response.status_code,
+            e.response.text[:500]  # truncate to avoid huge payloads in logs
+        )
+        raise
+    except requests.exceptions.RequestException:
+        logger.exception("Meta send-message network error")
+        raise
 
-        messages = [{"role": "system", "content": "You are an intelligent construction field ops assistant. Answer queries concisely for WhatsApp output. Use bold formatting where appropriate."}]
+# ---------------------------------------------------------------------------
+# AI agent processing
+# ---------------------------------------------------------------------------
+def process_whatsapp_message(sender_id, incoming_msg, message_id):
+    """Run the incoming message through the Groq AI agent and reply via Meta."""
+    logger.info("Processing message id=%s from=%s", message_id, sender_id)
 
-        for h in reversed(history_res.data or []):
-            if h["role"] in ["user", "assistant"]:
-                messages.append({"role": h["role"], "content": h["message_text"]})
+    try:
+        history_res = supabase.table("chat_sessions") \
+            .select("role, message_text") \
+            .eq("whatsapp_number", sender_id) \
+            .order("created_at", desc=True) \
+            .limit(6) \
+            .execute()
+    except Exception:
+        logger.exception("Supabase error fetching chat history")
+        history_res = type("R", (), {"data": []})()
 
-        messages.append({"role": "user", "content": incoming_msg})
-        supabase.table("chat_sessions").insert({"whatsapp_number": from_number, "role": "user", "message_text": incoming_msg}).execute()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an intelligent construction field ops assistant. "
+                "Answer queries concisely for WhatsApp output. "
+                "Use bold formatting where appropriate."
+            )
+        }
+    ]
 
+    for h in reversed(history_res.data or []):
+        if h["role"] in ("user", "assistant"):
+            messages.append({"role": h["role"], "content": h["message_text"]})
+
+    messages.append({"role": "user", "content": incoming_msg})
+
+    try:
+        supabase.table("chat_sessions").insert({
+            "whatsapp_number": sender_id,
+            "role": "user",
+            "message_text": incoming_msg
+        }).execute()
+    except Exception:
+        logger.exception("Supabase error inserting user message")
+
+    # --- First Groq call (may trigger tool calls) ---
+    try:
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
             tools=TOOLS,
             tool_choice="auto"
         )
+    except Exception:
+        logger.exception("Groq error on first completion call")
+        _send_error_reply(sender_id)
+        return False
 
-        msg_obj = response.choices[0].message
+    msg_obj = response.choices[0].message
 
-        if msg_obj.tool_calls:
-            messages.append(msg_obj)
+    if msg_obj.tool_calls:
+        messages.append({
+            "role": "assistant",
+            "content": msg_obj.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in msg_obj.tool_calls
+            ]
+        })
 
-            for tool_call in msg_obj.tool_calls:
-                tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments)
-                tool_output = execute_tool(tool_name, tool_args)
+        for tool_call in msg_obj.tool_calls:
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+            tool_output = execute_tool(tool_name, tool_args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_output
+            })
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_output
-                })
-
+        # --- Second Groq call (final answer after tools) ---
+        try:
             second_response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=messages
             )
             reply_text = second_response.choices[0].message.content
-        else:
-            reply_text = msg_obj.content
-
-        supabase.table("chat_sessions").insert({"whatsapp_number": from_number, "role": "assistant", "message_text": reply_text}).execute()
-
-        twilio_client.messages.create(
-            from_=os.getenv("TWILIO_WHATSAPP_NUMBER"),
-            to=from_number,
-            content_sid=os.getenv("TWILIO_CONTENT_SID"),
-            content_variables=json.dumps({
-                "1": reply_text
-            })
-        )
-        return True
-
-    except Exception as e:
-        logging.exception("Failed to process WhatsApp message")
-        try:
-            supabase.table("chat_sessions").insert({
-                "whatsapp_number": from_number,
-                "role": "error",
-                "message_text": f"Processing error: {e}"
-            }).execute()
-
-            twilio_client.messages.create(
-                from_=os.getenv("TWILIO_WHATSAPP_NUMBER"),
-                to=from_number,
-                body="⚠️ Sorry, I encountered an error processing your request. Please try again."
-            )
         except Exception:
-            logging.exception("Failed to write error or send message")
+            logger.exception("Groq error on second completion call")
+            _send_error_reply(sender_id)
+            return False
+    else:
+        reply_text = msg_obj.content
+
+    try:
+        supabase.table("chat_sessions").insert({
+            "whatsapp_number": sender_id,
+            "role": "assistant",
+            "message_text": reply_text
+        }).execute()
+    except Exception:
+        logger.exception("Supabase error inserting assistant message")
+
+    # --- Send reply via Meta ---
+    try:
+        send_whatsapp_message(sender_id, reply_text)
+    except Exception:
+        logger.exception("Meta send-message error — reply not delivered to %s", sender_id)
         return False
 
-@app.route("/webhook/whatsapp", methods=["GET", "POST"],strict_slashes=False)
-def whatsapp_webhook():
-    if request.method == "GET":
+    return True
+
+
+def _send_error_reply(sender_id):
+    """Attempt to send a generic error message back to the user via Meta."""
+    try:
+        send_whatsapp_message(
+            sender_id,
+            "⚠️ Sorry, I encountered an error processing your request. Please try again."
+        )
+    except Exception:
+        logger.exception("Meta send-message error while sending error reply to %s", sender_id)
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def health():
+    """Simple health-check endpoint."""
+    return {"status": "ok", "service": "Construction AI Agent"}, 200
+
+
+@app.route("/webhook/whatsapp", methods=["GET"], strict_slashes=False)
+def verify_whatsapp_webhook():
+    """
+    Meta webhook verification handshake.
+    Meta sends: hub.mode, hub.verify_token, hub.challenge
+    """
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if not mode and not token:
+        # No verification params — simple health probe
         return "WhatsApp Webhook Endpoint is Active!", 200
 
-    from_number = request.values.get("From", "")
-    incoming_msg = request.values.get("Body", "").strip()
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        logger.info("Meta webhook verification successful")
+        return challenge, 200
 
-    # Synchronous processing suitable for Vercel Serverless Functions
-    process_whatsapp_message(from_number, incoming_msg)
+    logger.warning("Meta webhook verification failed: mode=%s token_match=%s", mode, token == META_VERIFY_TOKEN)
+    return "Forbidden", 403
 
-    resp = MessagingResponse()
-    return str(resp)
+
+@app.route("/webhook/whatsapp", methods=["POST"], strict_slashes=False)
+def receive_whatsapp_webhook():
+    """
+    Receives incoming WhatsApp messages and status events from Meta.
+    Always returns HTTP 200 to acknowledge receipt.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        logger.exception("Meta incoming webhook — failed to parse JSON body")
+        return "Bad Request", 400
+
+    # Meta payload structure: entry -> changes -> value -> messages / statuses
+    try:
+        entries = data.get("entry", [])
+        for entry in entries:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+
+                # --- Handle status / delivery / read events (not messages) ---
+                statuses = value.get("statuses", [])
+                if statuses:
+                    for status in statuses:
+                        logger.info(
+                            "Meta status event: id=%s status=%s",
+                            status.get("id"), status.get("status")
+                        )
+                    continue  # nothing more to do for status events
+
+                # --- Handle incoming messages ---
+                messages = value.get("messages", [])
+                if not messages:
+                    logger.info("Meta webhook: no messages in this change, skipping")
+                    continue
+
+                msg = messages[0]
+                message_id = msg.get("id", "unknown")
+                sender_id = msg.get("from", "")
+                msg_type = msg.get("type", "unknown")
+
+                logger.info(
+                    "Meta incoming message: id=%s from=%s type=%s",
+                    message_id, sender_id, msg_type
+                )
+
+                if msg_type != "text":
+                    logger.info(
+                        "Non-text message type '%s' from %s (id=%s) — acknowledged, not processed",
+                        msg_type, sender_id, message_id
+                    )
+                    continue
+
+                incoming_msg = msg.get("text", {}).get("body", "").strip()
+                if not incoming_msg:
+                    logger.warning("Empty text body from %s (id=%s) — skipping", sender_id, message_id)
+                    continue
+
+                # Synchronous processing (compatible with Vercel serverless)
+                process_whatsapp_message(sender_id, incoming_msg, message_id)
+
+    except Exception:
+        logger.exception("Meta incoming webhook — unexpected error while processing payload")
+        # Return 200 anyway so Meta does not keep retrying with a bad payload
+        return "OK", 200
+
+    return "OK", 200
+
 
 @app.route("/debug/chat_sessions", methods=["GET"])
 def debug_chat_sessions():
@@ -196,5 +406,5 @@ def debug_chat_sessions():
         res = supabase.table("chat_sessions").select("*").order("created_at", desc=True).limit(10).execute()
         return {"count": len(res.data or []), "recent": res.data}
     except Exception as e:
-        logging.exception("Debug chat_sessions failed")
+        logger.exception("Debug chat_sessions failed")
         return {"error": str(e)}, 500
