@@ -24,12 +24,19 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID")
-META_WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("META_WHATSAPP_BUSINESS_ACCOUNT_ID")
+META_WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("META_WHATSAPP_BUSINESS_ACCOUNT_ID") or os.getenv("META_WABA_ID")
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 
 META_GRAPH_API_VERSION = "v21.0"
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Log safe masked configuration
+logger.info(
+    "[META CONFIG] phone_number_id=%s*** waba_id=%s*** webhook_path=/webhook/whatsapp",
+    str(META_PHONE_NUMBER_ID)[:4] if META_PHONE_NUMBER_ID else "none",
+    str(META_WHATSAPP_BUSINESS_ACCOUNT_ID)[:4] if META_WHATSAPP_BUSINESS_ACCOUNT_ID else "none"
+)
 
 # ---------------------------------------------------------------------------
 # Lazy client initialisation
@@ -463,6 +470,7 @@ def receive_whatsapp_webhook():
     # -----------------------------------------------------------------------
     print("=== META WHATSAPP WEBHOOK POST RECEIVED ===", flush=True)
     logger.info("=== META WHATSAPP WEBHOOK POST RECEIVED ===")
+    logger.info("[WEBHOOK] POST received")
     logger.info("[WEBHOOK] method=%s path=%s content_type=%s",
                 request.method, request.path, request.content_type)
 
@@ -473,9 +481,9 @@ def receive_whatsapp_webhook():
         logger.exception("[WEBHOOK] Failed to parse JSON body")
         return "OK", 200  # always return 200 to Meta
 
-    # Safe diagnostic — log structure without sensitive content
-    logger.info("[WEBHOOK] object=%s entry_count=%d",
-                data.get("object"), len(data.get("entry", [])))
+    entries = data.get("entry", [])
+    logger.info("[WEBHOOK] object=%s", data.get("object"))
+    logger.info("[WEBHOOK] entry_count=%d", len(entries))
 
     # -----------------------------------------------------------------------
     # Return HTTP 200 to Meta IMMEDIATELY.
@@ -486,13 +494,17 @@ def receive_whatsapp_webhook():
     # -----------------------------------------------------------------------
     def _process_in_background():
         try:
-            entries = data.get("entry", [])
             for entry in entries:
                 for change in entry.get("changes", []):
+                    field = change.get("field", "unknown")
                     value = change.get("value", {})
+                    statuses = value.get("statuses", [])
+                    msgs = value.get("messages", [])
+
+                    logger.info("[WEBHOOK] field=%s", field)
+                    logger.info("[WEBHOOK] message_event=%s", str(bool(msgs)).lower())
 
                     # Status / delivery / read events — acknowledge and skip
-                    statuses = value.get("statuses", [])
                     if statuses:
                         for status in statuses:
                             logger.info(
@@ -502,7 +514,6 @@ def receive_whatsapp_webhook():
                         continue
 
                     # Incoming messages
-                    msgs = value.get("messages", [])
                     if not msgs:
                         logger.info("[WEBHOOK] No messages in this change entry, skipping")
                         continue
@@ -515,10 +526,10 @@ def receive_whatsapp_webhook():
                     # Mask sender for safe logging (show first 4 digits only)
                     masked_sender = str(sender_id)[:4] + "***" if sender_id else "unknown"
 
-                    logger.info(
-                        "[WEBHOOK] Incoming message: id=%s from=%s type=%s",
-                        message_id, masked_sender, msg_type
-                    )
+                    logger.info("[WEBHOOK] REAL MESSAGE RECEIVED")
+                    logger.info("[WEBHOOK] message_id=%s", message_id)
+                    logger.info("[WEBHOOK] sender=%s", masked_sender)
+                    logger.info("[WEBHOOK] type=%s", msg_type)
 
                     if msg_type != "text":
                         logger.info(
