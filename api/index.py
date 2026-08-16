@@ -71,7 +71,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_project_summary",
-            "description": "Fetch overall progress, expenses, and equipment stats for a given project name.",
+            "description": "Fetch overall progress totals, total expenses, and equipment stats for a given project name.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,11 +87,38 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_recent_expenses",
-            "description": "Get recent site expenses. The limit must be a whole number between 1 and 50.",
+            "name": "get_daily_logs",
+            "description": "Get daily site progress logs (including trenching meters, pipe laid meters, backfilling meters, and raw notes) for a project or all projects, ordered by date.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project to fetch daily logs for (e.g. 'Pipeline Alpha')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of daily log entries to return (default 5, max 50).",
+                        "minimum": 1,
+                        "maximum": 50
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_expenses",
+            "description": "Get site expenses (category, amount, payment mode, vendor/recipient, date, notes). Can optionally filter by project name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Optional project name to filter expenses for (e.g. 'Pipeline Alpha')."
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Number of expenses to return, e.g. 5 or 10.",
@@ -120,15 +147,16 @@ def execute_tool(name, args):
             return json.dumps({"error": "Database error fetching project."})
 
         if not res.data:
+            logger.info("[DB TEST] tool=get_project_summary project=%s rows=0 returned_keys=[] result_passed_to_llm=true", p_name)
             return json.dumps({"error": f"No project found matching '{p_name}'"})
 
         project_id = res.data[0]["id"]
         p_real_name = res.data[0]["project_name"]
 
         try:
-            logs    = supabase.table("daily_logs").select("*").eq("project_id", project_id).execute().data or []
+            logs     = supabase.table("daily_logs").select("*").eq("project_id", project_id).execute().data or []
             expenses = supabase.table("expenses").select("*").eq("project_id", project_id).execute().data or []
-            equip   = supabase.table("equipment_logs").select("*").eq("project_id", project_id).execute().data or []
+            equip    = supabase.table("equipment_logs").select("*").eq("project_id", project_id).execute().data or []
         except Exception:
             logger.exception("Supabase error fetching project sub-tables")
             return json.dumps({"error": "Database error fetching project details."})
@@ -137,15 +165,22 @@ def execute_tool(name, args):
         total_pipe      = sum(l.get("pipe_laid_meters", 0) or 0 for l in logs)
         total_spent     = sum(e.get("amount", 0) or 0 for e in expenses)
 
-        return json.dumps({
+        summary_data = {
             "project_name": p_real_name,
             "total_trenching_meters": total_trenching,
             "total_pipe_laid_meters": total_pipe,
             "total_expenses_inr": total_spent,
-            "equipment_logs_count": len(equip)
-        })
+            "equipment_logs_count": len(equip),
+            "total_daily_logs_count": len(logs)
+        }
+        logger.info(
+            "[DB TEST] tool=get_project_summary project=%s rows=%d returned_keys=%s result_passed_to_llm=true",
+            p_real_name, len(logs), list(summary_data.keys())
+        )
+        return json.dumps(summary_data)
 
-    elif name == "get_recent_expenses":
+    elif name == "get_daily_logs":
+        p_name = args.get("project_name")
         limit = args.get("limit", 5)
         try:
             limit = int(limit)
@@ -153,15 +188,80 @@ def execute_tool(name, args):
             limit = 5
         limit = max(1, min(limit, 50))
 
+        query = supabase.table("daily_logs").select(
+            "log_date, trenching_meters, pipe_laid_meters, backfilling_meters, raw_notes"
+        )
+        project_matched = None
+        if p_name:
+            try:
+                p_res = supabase.table("projects").select("id, project_name").ilike("project_name", f"%{p_name}%").execute()
+                if not p_res.data:
+                    logger.info("[DB TEST] tool=get_daily_logs project=%s rows=0 returned_keys=[] result_passed_to_llm=true", p_name)
+                    return json.dumps({"error": f"No project found matching '{p_name}'"})
+                pid = p_res.data[0]["id"]
+                project_matched = p_res.data[0]["project_name"]
+                query = query.eq("project_id", pid)
+            except Exception:
+                logger.exception("Supabase error looking up project for get_daily_logs")
+                return json.dumps({"error": "Database error fetching project."})
+
         try:
-            res = supabase.table("expenses").select(
-                "category, amount, payment_mode, vendor_or_recipient, expense_date"
-            ).order("expense_date", desc=True).limit(limit).execute()
+            res = query.order("log_date", desc=True).limit(limit).execute()
+            rows = res.data or []
+            sample_keys = list(rows[0].keys()) if rows else []
+            logger.info(
+                "[DB TEST] tool=get_daily_logs project=%s rows=%d returned_keys=%s result_passed_to_llm=true",
+                project_matched or p_name or "All", len(rows), sample_keys
+            )
+            return json.dumps({
+                "project_name": project_matched or "All Projects",
+                "daily_logs": rows
+            })
+        except Exception:
+            logger.exception("Supabase error in get_daily_logs")
+            return json.dumps({"error": "Database error fetching daily logs."})
+
+    elif name == "get_recent_expenses":
+        p_name = args.get("project_name")
+        limit = args.get("limit", 5)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(limit, 50))
+
+        query = supabase.table("expenses").select(
+            "category, amount, payment_mode, vendor_or_recipient, expense_date, notes"
+        )
+        project_matched = None
+        if p_name:
+            try:
+                p_res = supabase.table("projects").select("id, project_name").ilike("project_name", f"%{p_name}%").execute()
+                if not p_res.data:
+                    logger.info("[DB TEST] tool=get_recent_expenses project=%s rows=0 returned_keys=[] result_passed_to_llm=true", p_name)
+                    return json.dumps({"error": f"No project found matching '{p_name}'"})
+                pid = p_res.data[0]["id"]
+                project_matched = p_res.data[0]["project_name"]
+                query = query.eq("project_id", pid)
+            except Exception:
+                logger.exception("Supabase error looking up project for get_recent_expenses")
+                return json.dumps({"error": "Database error fetching project."})
+
+        try:
+            res = query.order("expense_date", desc=True).limit(limit).execute()
+            rows = res.data or []
+            sample_keys = list(rows[0].keys()) if rows else []
+            logger.info(
+                "[DB TEST] tool=get_recent_expenses project=%s rows=%d returned_keys=%s result_passed_to_llm=true",
+                project_matched or p_name or "All", len(rows), sample_keys
+            )
+            return json.dumps({
+                "project_name": project_matched or "All Projects",
+                "expenses": rows
+            })
         except Exception:
             logger.exception("Supabase error in get_recent_expenses")
             return json.dumps({"error": "Database error fetching expenses."})
-
-        return json.dumps(res.data)
 
     return json.dumps({"error": "Unknown tool function."})
 
@@ -277,7 +377,10 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             "content": (
                 "You are an intelligent construction field ops assistant. "
                 "Answer queries concisely for WhatsApp output. "
-                "Use bold formatting where appropriate."
+                "Use bold formatting where appropriate. "
+                "Always use the available database tools to fetch accurate real-time data. "
+                "Never invent, hallucinate, or assume progress metrics, meter counts, costs, or notes that are not returned by the database tools. "
+                "If data is not found in the database, clearly state that no records exist."
             )
         }
     ]
@@ -340,6 +443,7 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         return False
 
     msg_obj = response.choices[0].message
+    logger.info("[TOOL DEBUG] tool_calls=%s", str(bool(msg_obj.tool_calls)).lower())
     logger.info("[PIPELINE] Stage 5 — finish_reason=%s tool_calls=%s",
                 response.choices[0].finish_reason,
                 bool(msg_obj.tool_calls))
@@ -376,6 +480,8 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                              tool_name)
                 tool_args = {}
 
+            logger.info("[TOOL DEBUG] name=%s", tool_name)
+            logger.info("[TOOL DEBUG] arguments=%s", tool_args)
             logger.info("[PIPELINE] Stage 6 — Executing tool: %s", tool_name)
             try:
                 tool_output = execute_tool(tool_name, tool_args)
