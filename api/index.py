@@ -1,12 +1,12 @@
 import os
 import json
+import traceback
 import requests
 from flask import Flask, request, Response
 from supabase import create_client, Client as SupabaseClient
 from groq import Groq
 from dotenv import load_dotenv
 import logging
-import threading
 
 load_dotenv()
 
@@ -227,22 +227,31 @@ def send_whatsapp_message(to, message):
 # ---------------------------------------------------------------------------
 def process_whatsapp_message(sender_id, incoming_msg, message_id):
     """Run the incoming message through the Groq AI agent and reply via Meta."""
+    print("[PIPELINE] -- START process_whatsapp_message --", flush=True)
+    logger.info("[PIPELINE] -- START process_whatsapp_message --")
     logger.info("[PIPELINE] ── START id=%s from=%s*** ──", message_id, str(sender_id)[:4])
+
+    print("[PIPELINE] Extracted message text", flush=True)
     logger.info("[PIPELINE] Extracted message text (len=%d)", len(incoming_msg))
     logger.info("[PIPELINE] Sender ID prefix: %s***", str(sender_id)[:4])
 
     # ── Stage 1: Supabase client init ────────────────────────────────────────
-    logger.info("[PIPELINE] Stage 1 — Initialising Supabase client")
+    print("[PIPELINE] Stage 1 starting", flush=True)
+    logger.info("[PIPELINE] Stage 1 starting — Initialising Supabase client")
     try:
         supabase = get_supabase()
-        logger.info("[PIPELINE] Stage 1 — Supabase client OK")
-    except Exception:
+        print("[PIPELINE] Stage 1 completed", flush=True)
+        logger.info("[PIPELINE] Stage 1 completed — Supabase client OK")
+    except Exception as e:
+        print("[PIPELINE] Stage 1 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 1 FAILED — could not create Supabase client")
         _send_error_reply(sender_id)
         return False
 
     # ── Stage 2: CRM history lookup ───────────────────────────────────────────
-    logger.info("[PIPELINE] Stage 2 — Starting CRM history lookup")
+    print("[PIPELINE] Stage 2 starting", flush=True)
+    logger.info("[PIPELINE] Stage 2 starting — Starting CRM history lookup")
     try:
         history_res = (
             supabase.table("chat_sessions")
@@ -252,9 +261,12 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             .limit(6)
             .execute()
         )
-        logger.info("[PIPELINE] Stage 2 — CRM lookup completed, rows=%d",
+        print("[PIPELINE] Stage 2 completed", flush=True)
+        logger.info("[PIPELINE] Stage 2 completed — CRM lookup completed, rows=%d",
                     len(history_res.data or []))
-    except Exception:
+    except Exception as e:
+        print("[PIPELINE] Stage 2 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 2 FAILED — Supabase history fetch error")
         history_res = type("R", (), {"data": []})()
 
@@ -276,30 +288,39 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     logger.info("[PIPELINE] LLM context built: %d message(s) (incl. system)", len(messages))
 
     # ── Stage 3: Persist user message ────────────────────────────────────────
-    logger.info("[PIPELINE] Stage 3 — Persisting user message to Supabase")
+    print("[PIPELINE] Stage 3 starting", flush=True)
+    logger.info("[PIPELINE] Stage 3 starting — Persisting user message to Supabase")
     try:
         supabase.table("chat_sessions").insert({
             "whatsapp_number": sender_id,
             "role": "user",
             "message_text": incoming_msg
         }).execute()
-        logger.info("[PIPELINE] Stage 3 — User message persisted OK")
-    except Exception:
+        print("[PIPELINE] Stage 3 completed", flush=True)
+        logger.info("[PIPELINE] Stage 3 completed — User message persisted OK")
+    except Exception as e:
+        print("[PIPELINE] Stage 3 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 3 FAILED — Supabase insert user message error")
         # Non-fatal: continue even if logging to DB fails
 
     # ── Stage 4: Groq client init ─────────────────────────────────────────────
-    logger.info("[PIPELINE] Stage 4 — Initialising Groq client")
+    print("[PIPELINE] Stage 4 starting", flush=True)
+    logger.info("[PIPELINE] Stage 4 starting — Initialising Groq client")
     try:
         groq_client = get_groq()
-        logger.info("[PIPELINE] Stage 4 — Groq client OK")
-    except Exception:
+        print("[PIPELINE] Stage 4 completed", flush=True)
+        logger.info("[PIPELINE] Stage 4 completed — Groq client OK")
+    except Exception as e:
+        print("[PIPELINE] Stage 4 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 4 FAILED — could not create Groq client")
         _send_error_reply(sender_id)
         return False
 
     # ── Stage 5: First LLM call ───────────────────────────────────────────────
-    logger.info("[PIPELINE] Stage 5 — Starting LLM call (model=%s, messages=%d)",
+    print("[PIPELINE] Stage 5 starting", flush=True)
+    logger.info("[PIPELINE] Stage 5 starting — Starting LLM call (model=%s, messages=%d)",
                 GROQ_MODEL, len(messages))
     try:
         response = groq_client.chat.completions.create(
@@ -309,8 +330,11 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             tool_choice="auto",
             timeout=25  # seconds — prevents indefinite hang
         )
-        logger.info("[PIPELINE] Stage 5 — LLM call completed")
-    except Exception:
+        print("[PIPELINE] Stage 5 completed", flush=True)
+        logger.info("[PIPELINE] Stage 5 completed — LLM call completed")
+    except Exception as e:
+        print("[PIPELINE] Stage 5 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 5 FAILED — Groq first LLM call error")
         _send_error_reply(sender_id)
         return False
@@ -322,6 +346,8 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
 
     # ── Stage 6: Tool execution (if requested) ────────────────────────────────
     if msg_obj.tool_calls:
+        print("[PIPELINE] Stage 6 starting", flush=True)
+        logger.info("[PIPELINE] Stage 6 starting")
         tool_names = [tc.function.name for tc in msg_obj.tool_calls]
         logger.info("[PIPELINE] Stage 6 — Tool calls requested: %s", tool_names)
 
@@ -355,7 +381,9 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                 tool_output = execute_tool(tool_name, tool_args)
                 logger.info("[PIPELINE] Stage 6 — Tool %s completed, output_len=%d",
                             tool_name, len(tool_output))
-            except Exception:
+            except Exception as e:
+                print(f"[PIPELINE] Stage 6 tool {tool_name} FAILED", flush=True)
+                traceback.print_exc()
                 logger.exception("[PIPELINE] Stage 6 FAILED — tool %s raised exception",
                                  tool_name)
                 tool_output = json.dumps({"error": "Tool execution failed."})
@@ -366,8 +394,12 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                 "content": tool_output
             })
 
+        print("[PIPELINE] Stage 6 completed", flush=True)
+        logger.info("[PIPELINE] Stage 6 completed")
+
         # ── Stage 7: Second LLM call (final answer after tools) ───────────────
-        logger.info("[PIPELINE] Stage 7 — Starting second LLM call (after tools)")
+        print("[PIPELINE] Stage 7 starting", flush=True)
+        logger.info("[PIPELINE] Stage 7 starting — Starting second LLM call (after tools)")
         try:
             second_response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
@@ -375,36 +407,50 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                 timeout=25
             )
             reply_text = second_response.choices[0].message.content
-            logger.info("[PIPELINE] Stage 7 — Second LLM call completed")
-        except Exception:
+            print("[PIPELINE] Stage 7 completed", flush=True)
+            logger.info("[PIPELINE] Stage 7 completed — Second LLM call completed")
+        except Exception as e:
+            print("[PIPELINE] Stage 7 FAILED", flush=True)
+            traceback.print_exc()
             logger.exception("[PIPELINE] Stage 7 FAILED — Groq second LLM call error")
             _send_error_reply(sender_id)
             return False
     else:
+        print("[PIPELINE] Stage 6 starting", flush=True)
+        print("[PIPELINE] Stage 6 completed", flush=True)
         logger.info("[PIPELINE] Stage 6 — No tool calls, using direct LLM answer")
         reply_text = msg_obj.content
 
+    print("[PIPELINE] Generated response", flush=True)
     logger.info("[PIPELINE] Generated response (len=%d chars)", len(reply_text or ""))
 
     # ── Stage 8: Persist assistant reply ─────────────────────────────────────
-    logger.info("[PIPELINE] Stage 8 — Persisting assistant reply to Supabase")
+    print("[PIPELINE] Stage 8 starting", flush=True)
+    logger.info("[PIPELINE] Stage 8 starting — Persisting assistant reply to Supabase")
     try:
         supabase.table("chat_sessions").insert({
             "whatsapp_number": sender_id,
             "role": "assistant",
             "message_text": reply_text
         }).execute()
-        logger.info("[PIPELINE] Stage 8 — Assistant reply persisted OK")
-    except Exception:
+        print("[PIPELINE] Stage 8 completed", flush=True)
+        logger.info("[PIPELINE] Stage 8 completed — Assistant reply persisted OK")
+    except Exception as e:
+        print("[PIPELINE] Stage 8 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 8 FAILED — Supabase insert assistant message error")
         # Non-fatal: still attempt to send the reply
 
     # ── Stage 9: Send reply via Meta ──────────────────────────────────────────
-    logger.info("[PIPELINE] Stage 9 — Starting Meta send")
+    print("[PIPELINE] Stage 9 starting", flush=True)
+    logger.info("[PIPELINE] Stage 9 starting — Starting Meta send")
     try:
         send_whatsapp_message(sender_id, reply_text)
-        logger.info("[PIPELINE] Stage 9 — Meta send completed ✅")
-    except Exception:
+        print("[PIPELINE] Stage 9 completed", flush=True)
+        logger.info("[PIPELINE] Stage 9 completed ✅")
+    except Exception as e:
+        print("[PIPELINE] Stage 9 FAILED", flush=True)
+        traceback.print_exc()
         logger.exception("[PIPELINE] Stage 9 FAILED — Meta send-message error")
         return False
 
@@ -459,14 +505,9 @@ def verify_whatsapp_webhook():
 def receive_whatsapp_webhook():
     """
     Receives incoming WhatsApp messages and status events from Meta.
-
-    IMPORTANT: We return HTTP 200 as quickly as possible (before processing)
-    so Meta does not time out waiting for a response and retry the delivery.
-    Processing is done in a background thread.
     """
     # -----------------------------------------------------------------------
     # DIAGNOSTIC BANNER — appears in Vercel logs for every POST received.
-    # If this never appears, the request is not reaching the Vercel function.
     # -----------------------------------------------------------------------
     print("=== META WHATSAPP WEBHOOK POST RECEIVED ===", flush=True)
     logger.info("=== META WHATSAPP WEBHOOK POST RECEIVED ===")
@@ -485,73 +526,70 @@ def receive_whatsapp_webhook():
     logger.info("[WEBHOOK] object=%s", data.get("object"))
     logger.info("[WEBHOOK] entry_count=%d", len(entries))
 
-    # -----------------------------------------------------------------------
-    # Return HTTP 200 to Meta IMMEDIATELY.
-    # Processing happens in a background thread so we don't block the response.
-    # Meta requires a 200 within ~20 seconds; Vercel hobby timeout is 10s.
-    # Synchronous LLM + DB calls easily exceed 10s → the webhook times out
-    # without this pattern, which causes Meta to stop delivering messages.
-    # -----------------------------------------------------------------------
-    def _process_in_background():
-        try:
-            for entry in entries:
-                for change in entry.get("changes", []):
-                    field = change.get("field", "unknown")
-                    value = change.get("value", {})
-                    statuses = value.get("statuses", [])
-                    msgs = value.get("messages", [])
+    try:
+        for entry in entries:
+            for change in entry.get("changes", []):
+                field = change.get("field", "unknown")
+                value = change.get("value", {})
+                statuses = value.get("statuses", [])
+                msgs = value.get("messages", [])
 
-                    logger.info("[WEBHOOK] field=%s", field)
-                    logger.info("[WEBHOOK] message_event=%s", str(bool(msgs)).lower())
+                logger.info("[WEBHOOK] field=%s", field)
+                logger.info("[WEBHOOK] message_event=%s", str(bool(msgs)).lower())
 
-                    # Status / delivery / read events — acknowledge and skip
-                    if statuses:
-                        for status in statuses:
-                            logger.info(
-                                "[WEBHOOK] Status event: id=%s status=%s",
-                                status.get("id"), status.get("status")
-                            )
-                        continue
-
-                    # Incoming messages
-                    if not msgs:
-                        logger.info("[WEBHOOK] No messages in this change entry, skipping")
-                        continue
-
-                    msg        = msgs[0]
-                    message_id = msg.get("id", "unknown")
-                    sender_id  = msg.get("from", "")
-                    msg_type   = msg.get("type", "unknown")
-
-                    # Mask sender for safe logging (show first 4 digits only)
-                    masked_sender = str(sender_id)[:4] + "***" if sender_id else "unknown"
-
-                    logger.info("[WEBHOOK] REAL MESSAGE RECEIVED")
-                    logger.info("[WEBHOOK] message_id=%s", message_id)
-                    logger.info("[WEBHOOK] sender=%s", masked_sender)
-                    logger.info("[WEBHOOK] type=%s", msg_type)
-
-                    if msg_type != "text":
+                # Status / delivery / read events — acknowledge and skip
+                if statuses:
+                    for status in statuses:
                         logger.info(
-                            "[WEBHOOK] Non-text type '%s' from %s — acknowledged, not processed",
-                            msg_type, masked_sender
+                            "[WEBHOOK] Status event: id=%s status=%s",
+                            status.get("id"), status.get("status")
                         )
-                        continue
+                    continue
 
-                    incoming_msg = msg.get("text", {}).get("body", "").strip()
-                    if not incoming_msg:
-                        logger.warning("[WEBHOOK] Empty text body from %s — skipping", masked_sender)
-                        continue
+                # Incoming messages
+                if not msgs:
+                    logger.info("[WEBHOOK] No messages in this change entry, skipping")
+                    continue
 
-                    logger.info("[WEBHOOK] Message received, handing to pipeline")
+                msg        = msgs[0]
+                message_id = msg.get("id", "unknown")
+                sender_id  = msg.get("from", "")
+                msg_type   = msg.get("type", "unknown")
+
+                # Mask sender for safe logging (show first 4 digits only)
+                masked_sender = str(sender_id)[:4] + "***" if sender_id else "unknown"
+
+                logger.info("[WEBHOOK] REAL MESSAGE RECEIVED")
+                logger.info("[WEBHOOK] message_id=%s", message_id)
+                logger.info("[WEBHOOK] sender=%s", masked_sender)
+                logger.info("[WEBHOOK] type=%s", msg_type)
+
+                if msg_type != "text":
+                    logger.info(
+                        "[WEBHOOK] Non-text type '%s' from %s — acknowledged, not processed",
+                        msg_type, masked_sender
+                    )
+                    continue
+
+                incoming_msg = msg.get("text", {}).get("body", "").strip()
+                if not incoming_msg:
+                    logger.warning("[WEBHOOK] Empty text body from %s — skipping", masked_sender)
+                    continue
+
+                logger.info("[WEBHOOK] Message received, handing to pipeline")
+                print("[PIPELINE] ABOUT TO CALL process_whatsapp_message()", flush=True)
+                logger.info("[PIPELINE] ABOUT TO CALL process_whatsapp_message()")
+                try:
                     process_whatsapp_message(sender_id, incoming_msg, message_id)
+                    print("[PIPELINE] process_whatsapp_message() RETURNED", flush=True)
+                    logger.info("[PIPELINE] process_whatsapp_message() RETURNED")
+                except Exception as e:
+                    print("[PIPELINE] EXCEPTION while calling process_whatsapp_message():", e, flush=True)
+                    logger.exception("[PIPELINE] EXCEPTION while calling process_whatsapp_message()")
+                    traceback.print_exc()
 
-        except Exception:
-            logger.exception("[WEBHOOK] Unexpected error in background processing")
-
-    # Spawn background thread and return 200 immediately
-    thread = threading.Thread(target=_process_in_background, daemon=True)
-    thread.start()
+    except Exception:
+        logger.exception("[WEBHOOK] Unexpected error in webhook processing")
 
     return "OK", 200
 
