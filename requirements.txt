@@ -1,0 +1,5 @@
+Flask
+requests
+supabase
+groq
+python-dotenv
