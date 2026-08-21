@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import datetime
 import traceback
 import requests
 from flask import Flask, request, Response
@@ -29,9 +31,10 @@ META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 
 META_GRAPH_API_VERSION = "v21.0"
 
+# Default model aligned with remote; override via GROQ_MODEL env var
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
 
-# Log safe masked configuration
+# Log safe masked configuration (never log full keys/tokens)
 logger.info(
     "[META CONFIG] phone_number_id=%s*** waba_id=%s*** webhook_path=/webhook/whatsapp",
     str(META_PHONE_NUMBER_ID)[:4] if META_PHONE_NUMBER_ID else "none",
@@ -40,12 +43,12 @@ logger.info(
 
 # ---------------------------------------------------------------------------
 # Lazy client initialisation
-# Clients are created on first use, not at module load time.
-# This prevents a startup crash from killing ALL routes (including POST)
-# when an env var is missing or a dependency fails to initialise.
+# Clients are created on first use to prevent startup crashes from killing
+# all routes when an env var is missing.
 # ---------------------------------------------------------------------------
 _supabase_client = None
 _groq_client = None
+
 
 def get_supabase():
     global _supabase_client
@@ -55,6 +58,7 @@ def get_supabase():
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase_client
 
+
 def get_groq():
     global _groq_client
     if _groq_client is None:
@@ -63,21 +67,96 @@ def get_groq():
         _groq_client = Groq(api_key=GROQ_API_KEY)
     return _groq_client
 
+
+# ---------------------------------------------------------------------------
+# Response sanitizer — strips <think>...</think> blocks (Requirement #2)
+# These blocks MUST NEVER reach WhatsApp or be stored as the assistant reply.
+# ---------------------------------------------------------------------------
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def sanitize_reply(text):
+    """Strip any <think>...</think> reasoning blocks from the LLM output."""
+    if not text:
+        return ""
+    cleaned = _THINK_RE.sub("", text).strip()
+    return cleaned if cleaned else text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers (Requirement #7)
+# ---------------------------------------------------------------------------
+
+def _resolve_project(supabase, project_name):
+    """
+    Resolve a project name (fuzzy match) to (project_id, canonical_name).
+    Raises ValueError with a user-friendly message if:
+      - project_name is empty
+      - no project matches
+      - multiple projects match (ambiguous)
+    """
+    if not project_name or not project_name.strip():
+        raise ValueError("project_name is required but was empty.")
+    res = supabase.table("projects").select("id, project_name").ilike(
+        "project_name", f"%{project_name.strip()}%"
+    ).execute()
+    rows = res.data or []
+    if len(rows) == 0:
+        raise ValueError(
+            f"No project found matching '{project_name}'. Check the name and try again."
+        )
+    if len(rows) > 1:
+        names = ", ".join(r["project_name"] for r in rows)
+        raise ValueError(
+            f"Ambiguous project name '{project_name}' matched multiple projects: {names}. "
+            "Please be more specific."
+        )
+    return rows[0]["id"], rows[0]["project_name"]
+
+
+def _validate_date(value, field_name="date"):
+    """Parse and return an ISO-8601 date string. Raises ValueError on failure."""
+    try:
+        parsed = datetime.date.fromisoformat(str(value).strip())
+        return str(parsed)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"'{field_name}' must be a valid ISO-8601 date (YYYY-MM-DD), got: '{value}'"
+        )
+
+
+def _validate_non_negative_number(value, field_name):
+    """Cast value to float and ensure it is >= 0. Raises ValueError on failure."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{field_name}' must be a number, got: '{value}'")
+    if num < 0:
+        raise ValueError(f"'{field_name}' must be >= 0, got: {num}")
+    return num
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas
+# Requirements: #4 read tools, #5 write tools, #6 dynamic attributes
 # ---------------------------------------------------------------------------
 TOOLS = [
+    # ── READ TOOLS ──────────────────────────────────────────────────────────
     {
         "type": "function",
         "function": {
             "name": "get_projects",
-            "description": "Fetch the list of construction projects from the database (including project name, location, and status). Use this whenever the user asks about active projects, ongoing projects, project list, or what projects exist.",
+            "description": (
+                "Fetch the list of construction projects from the database "
+                "(project name, location, status). Use whenever the user asks about "
+                "active/ongoing projects, project list, or what projects exist."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "Optional status filter (e.g. 'Active'). If omitted, returns all projects."
+                        "description": "Optional status filter e.g. 'Active'. Omit to return all."
                     }
                 },
                 "required": []
@@ -88,7 +167,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_project_summary",
-            "description": "Fetch overall progress totals, total expenses, and equipment stats for a given project name.",
+            "description": (
+                "Fetch overall progress totals, total expenses, and equipment stats "
+                "for a given project name."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -105,17 +187,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_daily_logs",
-            "description": "Get daily site progress logs (including trenching meters, pipe laid meters, backfilling meters, and raw notes) for a project or all projects, ordered by date.",
+            "description": (
+                "Get daily site progress logs (trenching, pipe laid, backfilling metres, notes) "
+                "for a project, ordered by date descending."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "project_name": {
                         "type": "string",
-                        "description": "Name of the project to fetch daily logs for (e.g. 'Pipeline Alpha')."
+                        "description": "Name of the project (e.g. 'Pipeline Alpha')."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Number of daily log entries to return (default 5, max 50).",
+                        "description": "Number of log entries to return (default 5, max 50).",
                         "minimum": 1,
                         "maximum": 50
                     }
@@ -128,17 +213,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_recent_expenses",
-            "description": "Get site expenses (category, amount, payment mode, vendor/recipient, date, notes). Can optionally filter by project name.",
+            "description": (
+                "Get site expenses (category, amount, payment mode, vendor/recipient, date, notes). "
+                "Can optionally filter by project name."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "project_name": {
                         "type": "string",
-                        "description": "Optional project name to filter expenses for (e.g. 'Pipeline Alpha')."
+                        "description": "Optional project name filter."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Number of expenses to return, e.g. 5 or 10.",
+                        "description": "Number of expenses to return (default 5, max 50).",
                         "minimum": 1,
                         "maximum": 50
                     }
@@ -146,51 +234,273 @@ TOOLS = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_equipment_logs",
+            "description": (
+                "Get equipment usage logs (equipment name, hours operated, fuel consumed, "
+                "operator name, notes, log date) for a project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project to fetch equipment logs for."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of equipment log entries to return (default 5, max 50).",
+                        "minimum": 1,
+                        "maximum": 50
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project_attributes",
+            "description": (
+                "Fetch flexible project-specific attributes from the project_attributes table "
+                "(e.g. workers_present, weather, soil_type, supervisor_name, machinery_count). "
+                "Use when the user asks about custom/extra details for a project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project whose attributes to retrieve."
+                    },
+                    "attribute_name": {
+                        "type": "string",
+                        "description": "Optional: filter by a specific attribute name."
+                    }
+                },
+                "required": ["project_name"]
+            }
+        }
+    },
+    # ── WRITE TOOLS ─────────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "create_daily_log",
+            "description": (
+                "Create a new daily site progress log entry for a project. "
+                "Use when the user wants to log today's (or a specific date's) trenching, "
+                "pipe-laying, backfilling progress, or site notes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project (resolved to project_id internally)."
+                    },
+                    "log_date": {
+                        "type": "string",
+                        "description": "Date of the log in YYYY-MM-DD format."
+                    },
+                    "trenching_meters": {
+                        "type": "number",
+                        "description": "Metres of trenching completed (optional, >= 0)."
+                    },
+                    "pipe_laid_meters": {
+                        "type": "number",
+                        "description": "Metres of pipe laid (optional, >= 0)."
+                    },
+                    "backfilling_meters": {
+                        "type": "number",
+                        "description": "Metres of backfilling completed (optional, >= 0)."
+                    },
+                    "raw_notes": {
+                        "type": "string",
+                        "description": "Free-text site notes (optional)."
+                    }
+                },
+                "required": ["project_name", "log_date"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_expense",
+            "description": (
+                "Record a new expense entry for a project. "
+                "Use when the user wants to log a payment, purchase, or cost."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project."
+                    },
+                    "expense_date": {
+                        "type": "string",
+                        "description": "Date of the expense in YYYY-MM-DD format."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Expense category (e.g. 'Labour', 'Fuel', 'Materials')."
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Amount in INR (must be >= 0)."
+                    },
+                    "payment_mode": {
+                        "type": "string",
+                        "description": "Payment mode (e.g. 'Cash', 'UPI', 'Bank Transfer')."
+                    },
+                    "vendor_or_recipient": {
+                        "type": "string",
+                        "description": "Vendor name or recipient (optional)."
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Additional notes (optional)."
+                    }
+                },
+                "required": ["project_name", "expense_date", "category", "amount", "payment_mode"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_equipment_log",
+            "description": (
+                "Record a new equipment usage log entry for a project. "
+                "Use when the user wants to log machinery/equipment usage for a day."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project."
+                    },
+                    "log_date": {
+                        "type": "string",
+                        "description": "Date of the log in YYYY-MM-DD format."
+                    },
+                    "equipment_name": {
+                        "type": "string",
+                        "description": "Name/type of the equipment (e.g. 'Excavator', 'Compressor')."
+                    },
+                    "hours_operated": {
+                        "type": "number",
+                        "description": "Hours the equipment was operated (optional, >= 0)."
+                    },
+                    "fuel_consumed_liters": {
+                        "type": "number",
+                        "description": "Fuel consumed in litres (optional, >= 0)."
+                    },
+                    "operator_name": {
+                        "type": "string",
+                        "description": "Name of the operator (optional)."
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Additional notes (optional)."
+                    }
+                },
+                "required": ["project_name", "log_date", "equipment_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_project_attribute",
+            "description": (
+                "Create or update a flexible project-specific attribute in the project_attributes table. "
+                "Use for ANY custom/extra attribute that does not fit the standard columns: "
+                "e.g. workers_present, weather, soil_type, machinery_count, supervisor_name, etc. "
+                "Attributes belong to projects, NOT to database columns. "
+                "If the attribute already exists for this project it is updated; "
+                "if it does not exist it is created. Never creates duplicates for the same project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Name of the project."
+                    },
+                    "attribute_name": {
+                        "type": "string",
+                        "description": (
+                            "Name of the attribute (snake_case preferred, e.g. 'workers_present', "
+                            "'weather', 'soil_type'). Use exactly what the user specifies; "
+                            "do NOT hardcode or invent attribute names."
+                        )
+                    },
+                    "attribute_value": {
+                        "type": "string",
+                        "description": (
+                            "The value to set (always stored as text). "
+                            "E.g. '25' for workers_present, 'Sunny' for weather, 'Clay' for soil_type."
+                        )
+                    },
+                    "attribute_type": {
+                        "type": "string",
+                        "description": (
+                            "Data type hint: 'numeric', 'text', or 'date'. "
+                            "Infer from context: numbers -> 'numeric', dates -> 'date', else 'text'."
+                        ),
+                        "enum": ["text", "numeric", "date"]
+                    }
+                },
+                "required": ["project_name", "attribute_name", "attribute_value"]
+            }
+        }
     }
 ]
+
 
 # ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
 def execute_tool(name, args):
     supabase = get_supabase()
+    logger.info("[TOOL DEBUG] called=true name=%s", name)
 
+    # ── READ: get_projects ───────────────────────────────────────────────────
     if name == "get_projects":
         status = args.get("status")
         try:
             query = supabase.table("projects").select("project_name, location, status")
             if status:
                 query = query.ilike("status", f"%{status}%")
-            res = query.order("created_at", desc=False).execute()
+            res  = query.order("created_at", desc=False).execute()
             rows = res.data or []
-            logger.info("[TOOL DEBUG] rows=%d", len(rows))
-            logger.info(
-                "[DB TEST] tool=get_projects status=%s rows=%d rows_data=%s result_passed_to_llm=true",
-                status or "All", len(rows), rows
-            )
-            return json.dumps({
-                "projects": rows,
-                "count": len(rows)
-            })
+            logger.info("[TOOL DEBUG] name=get_projects rows=%d", len(rows))
+            if not rows:
+                return json.dumps({"projects": [], "count": 0, "message": "No projects found."})
+            return json.dumps({"projects": rows, "count": len(rows)})
         except Exception:
             logger.exception("Supabase error in get_projects")
             return json.dumps({"error": "Database error fetching projects."})
 
+    # ── READ: get_project_summary ────────────────────────────────────────────
     elif name == "get_project_summary":
         p_name = args.get("project_name")
         try:
-            res = supabase.table("projects").select("*").ilike("project_name", f"%{p_name}%").execute()
+            project_id, p_real_name = _resolve_project(supabase, p_name)
+        except ValueError as ve:
+            logger.info("[TOOL DEBUG] name=get_project_summary rows=0 error=%s", ve)
+            return json.dumps({"error": str(ve)})
         except Exception:
-            logger.exception("Supabase error in get_project_summary")
+            logger.exception("Supabase error in get_project_summary lookup")
             return json.dumps({"error": "Database error fetching project."})
-
-        if not res.data:
-            logger.info("[TOOL DEBUG] rows=0")
-            logger.info("[DB TEST] tool=get_project_summary project=%s rows=0 rows_data=[] result_passed_to_llm=true", p_name)
-            return json.dumps({"error": f"No project found matching '{p_name}'"})
-
-        project_id = res.data[0]["id"]
-        p_real_name = res.data[0]["project_name"]
 
         try:
             logs     = supabase.table("daily_logs").select("*").eq("project_id", project_id).execute().data or []
@@ -205,28 +515,24 @@ def execute_tool(name, args):
         total_spent     = sum(e.get("amount", 0) or 0 for e in expenses)
 
         summary_data = {
-            "project_name": p_real_name,
+            "project_name":           p_real_name,
             "total_trenching_meters": total_trenching,
             "total_pipe_laid_meters": total_pipe,
-            "total_expenses_inr": total_spent,
-            "equipment_logs_count": len(equip),
+            "total_expenses_inr":     total_spent,
+            "equipment_logs_count":   len(equip),
             "total_daily_logs_count": len(logs)
         }
-        logger.info("[TOOL DEBUG] rows=%d", len(logs))
-        logger.info(
-            "[DB TEST] tool=get_project_summary project=%s rows=%d rows_data=%s result_passed_to_llm=true",
-            p_real_name, len(logs), summary_data
-        )
+        logger.info("[TOOL DEBUG] name=get_project_summary rows=%d", len(logs))
         return json.dumps(summary_data)
 
+    # ── READ: get_daily_logs ─────────────────────────────────────────────────
     elif name == "get_daily_logs":
         p_name = args.get("project_name")
-        limit = args.get("limit", 5)
+        limit  = args.get("limit", 5)
         try:
-            limit = int(limit)
+            limit = max(1, min(int(limit), 50))
         except (TypeError, ValueError):
             limit = 5
-        limit = max(1, min(limit, 50))
 
         query = supabase.table("daily_logs").select(
             "log_date, trenching_meters, pipe_laid_meters, backfilling_meters, raw_notes"
@@ -234,26 +540,25 @@ def execute_tool(name, args):
         project_matched = None
         if p_name:
             try:
-                p_res = supabase.table("projects").select("id, project_name").ilike("project_name", f"%{p_name}%").execute()
-                if not p_res.data:
-                    logger.info("[TOOL DEBUG] rows=0")
-                    logger.info("[DB TEST] tool=get_daily_logs project=%s rows=0 rows_data=[] result_passed_to_llm=true", p_name)
-                    return json.dumps({"error": f"No project found matching '{p_name}'"})
-                pid = p_res.data[0]["id"]
-                project_matched = p_res.data[0]["project_name"]
-                query = query.eq("project_id", pid)
+                project_id, project_matched = _resolve_project(supabase, p_name)
+                query = query.eq("project_id", project_id)
+            except ValueError as ve:
+                logger.info("[TOOL DEBUG] name=get_daily_logs rows=0 error=%s", ve)
+                return json.dumps({"error": str(ve)})
             except Exception:
                 logger.exception("Supabase error looking up project for get_daily_logs")
                 return json.dumps({"error": "Database error fetching project."})
 
         try:
-            res = query.order("log_date", desc=True).limit(limit).execute()
+            res  = query.order("log_date", desc=True).limit(limit).execute()
             rows = res.data or []
-            logger.info("[TOOL DEBUG] rows=%d", len(rows))
-            logger.info(
-                "[DB TEST] tool=get_daily_logs project=%s rows=%d rows_data=%s result_passed_to_llm=true",
-                project_matched or p_name or "All", len(rows), rows
-            )
+            logger.info("[TOOL DEBUG] name=get_daily_logs rows=%d", len(rows))
+            if not rows:
+                return json.dumps({
+                    "project_name": project_matched or "All Projects",
+                    "daily_logs": [],
+                    "message": "No daily logs found."
+                })
             return json.dumps({
                 "project_name": project_matched or "All Projects",
                 "daily_logs": rows
@@ -262,14 +567,14 @@ def execute_tool(name, args):
             logger.exception("Supabase error in get_daily_logs")
             return json.dumps({"error": "Database error fetching daily logs."})
 
+    # ── READ: get_recent_expenses ────────────────────────────────────────────
     elif name == "get_recent_expenses":
         p_name = args.get("project_name")
-        limit = args.get("limit", 5)
+        limit  = args.get("limit", 5)
         try:
-            limit = int(limit)
+            limit = max(1, min(int(limit), 50))
         except (TypeError, ValueError):
             limit = 5
-        limit = max(1, min(limit, 50))
 
         query = supabase.table("expenses").select(
             "category, amount, payment_mode, vendor_or_recipient, expense_date, notes"
@@ -277,26 +582,25 @@ def execute_tool(name, args):
         project_matched = None
         if p_name:
             try:
-                p_res = supabase.table("projects").select("id, project_name").ilike("project_name", f"%{p_name}%").execute()
-                if not p_res.data:
-                    logger.info("[TOOL DEBUG] rows=0")
-                    logger.info("[DB TEST] tool=get_recent_expenses project=%s rows=0 rows_data=[] result_passed_to_llm=true", p_name)
-                    return json.dumps({"error": f"No project found matching '{p_name}'"})
-                pid = p_res.data[0]["id"]
-                project_matched = p_res.data[0]["project_name"]
-                query = query.eq("project_id", pid)
+                project_id, project_matched = _resolve_project(supabase, p_name)
+                query = query.eq("project_id", project_id)
+            except ValueError as ve:
+                logger.info("[TOOL DEBUG] name=get_recent_expenses rows=0 error=%s", ve)
+                return json.dumps({"error": str(ve)})
             except Exception:
                 logger.exception("Supabase error looking up project for get_recent_expenses")
                 return json.dumps({"error": "Database error fetching project."})
 
         try:
-            res = query.order("expense_date", desc=True).limit(limit).execute()
+            res  = query.order("expense_date", desc=True).limit(limit).execute()
             rows = res.data or []
-            logger.info("[TOOL DEBUG] rows=%d", len(rows))
-            logger.info(
-                "[DB TEST] tool=get_recent_expenses project=%s rows=%d rows_data=%s result_passed_to_llm=true",
-                project_matched or p_name or "All", len(rows), rows
-            )
+            logger.info("[TOOL DEBUG] name=get_recent_expenses rows=%d", len(rows))
+            if not rows:
+                return json.dumps({
+                    "project_name": project_matched or "All Projects",
+                    "expenses": [],
+                    "message": "No expenses found."
+                })
             return json.dumps({
                 "project_name": project_matched or "All Projects",
                 "expenses": rows
@@ -305,13 +609,385 @@ def execute_tool(name, args):
             logger.exception("Supabase error in get_recent_expenses")
             return json.dumps({"error": "Database error fetching expenses."})
 
-    return json.dumps({"error": "Unknown tool function."})
+    # ── READ: get_equipment_logs ─────────────────────────────────────────────
+    elif name == "get_equipment_logs":
+        p_name = args.get("project_name")
+        limit  = args.get("limit", 5)
+        try:
+            limit = max(1, min(int(limit), 50))
+        except (TypeError, ValueError):
+            limit = 5
+
+        query = supabase.table("equipment_logs").select(
+            "log_date, equipment_name, hours_operated, fuel_consumed_liters, operator_name, notes"
+        )
+        project_matched = None
+        if p_name:
+            try:
+                project_id, project_matched = _resolve_project(supabase, p_name)
+                query = query.eq("project_id", project_id)
+            except ValueError as ve:
+                logger.info("[TOOL DEBUG] name=get_equipment_logs rows=0 error=%s", ve)
+                return json.dumps({"error": str(ve)})
+            except Exception:
+                logger.exception("Supabase error looking up project for get_equipment_logs")
+                return json.dumps({"error": "Database error fetching project."})
+
+        try:
+            res  = query.order("log_date", desc=True).limit(limit).execute()
+            rows = res.data or []
+            logger.info("[TOOL DEBUG] name=get_equipment_logs rows=%d", len(rows))
+            if not rows:
+                return json.dumps({
+                    "project_name": project_matched or "All Projects",
+                    "equipment_logs": [],
+                    "message": "No equipment logs found."
+                })
+            return json.dumps({
+                "project_name": project_matched or "All Projects",
+                "equipment_logs": rows
+            })
+        except Exception:
+            logger.exception("Supabase error in get_equipment_logs")
+            return json.dumps({"error": "Database error fetching equipment logs."})
+
+    # ── READ: get_project_attributes ─────────────────────────────────────────
+    elif name == "get_project_attributes":
+        p_name         = args.get("project_name")
+        attribute_name = args.get("attribute_name")
+
+        try:
+            project_id, project_matched = _resolve_project(supabase, p_name)
+        except ValueError as ve:
+            logger.info("[TOOL DEBUG] name=get_project_attributes rows=0 error=%s", ve)
+            return json.dumps({"error": str(ve)})
+        except Exception:
+            logger.exception("Supabase error in get_project_attributes project lookup")
+            return json.dumps({"error": "Database error fetching project."})
+
+        try:
+            query = supabase.table("project_attributes").select(
+                "attribute_name, attribute_type, attribute_value, created_at"
+            ).eq("project_id", project_id)
+            if attribute_name:
+                query = query.ilike("attribute_name", attribute_name.strip())
+            res  = query.order("created_at", desc=True).execute()
+            rows = res.data or []
+            logger.info("[TOOL DEBUG] name=get_project_attributes rows=%d", len(rows))
+            if not rows:
+                return json.dumps({
+                    "project_name": project_matched,
+                    "attributes": [],
+                    "message": "No attributes found for this project."
+                })
+            return json.dumps({
+                "project_name": project_matched,
+                "attributes": rows
+            })
+        except Exception:
+            logger.exception("Supabase error in get_project_attributes")
+            return json.dumps({"error": "Database error fetching project attributes."})
+
+    # ── WRITE: create_daily_log ──────────────────────────────────────────────
+    elif name == "create_daily_log":
+        p_name   = args.get("project_name")
+        log_date = args.get("log_date")
+
+        if not p_name:
+            return json.dumps({"error": "project_name is required."})
+        if not log_date:
+            return json.dumps({"error": "log_date is required (YYYY-MM-DD)."})
+
+        try:
+            project_id, p_real_name = _resolve_project(supabase, p_name)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+        except Exception:
+            logger.exception("Supabase error in create_daily_log project lookup")
+            return json.dumps({"error": "Database error resolving project."})
+
+        try:
+            log_date = _validate_date(log_date, "log_date")
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+
+        row = {"project_id": project_id, "log_date": log_date}
+        for field in ("trenching_meters", "pipe_laid_meters", "backfilling_meters"):
+            val = args.get(field)
+            if val is not None:
+                try:
+                    row[field] = _validate_non_negative_number(val, field)
+                except ValueError as ve:
+                    return json.dumps({"error": str(ve)})
+        raw_notes = args.get("raw_notes")
+        if raw_notes:
+            row["raw_notes"] = str(raw_notes).strip()
+
+        try:
+            res      = supabase.table("daily_logs").insert(row).execute()
+            inserted = res.data[0] if res.data else row
+            logger.info("[TOOL DEBUG] name=create_daily_log action=write rows=1 project=%s date=%s",
+                        p_real_name, log_date)
+            return json.dumps({
+                "success": True,
+                "message": f"Daily log created for '{p_real_name}' on {log_date}.",
+                "record":  inserted
+            })
+        except Exception:
+            logger.exception("Supabase error inserting daily log")
+            return json.dumps({"error": "Database error creating daily log."})
+
+    # ── WRITE: create_expense ────────────────────────────────────────────────
+    elif name == "create_expense":
+        p_name       = args.get("project_name")
+        expense_date = args.get("expense_date")
+        category     = args.get("category")
+        amount       = args.get("amount")
+        payment_mode = args.get("payment_mode")
+
+        missing = [f for f, v in [
+            ("project_name", p_name), ("expense_date", expense_date),
+            ("category", category), ("amount", amount), ("payment_mode", payment_mode)
+        ] if not v and v != 0]
+        if missing:
+            return json.dumps({"error": f"Missing required fields: {', '.join(missing)}."})
+
+        try:
+            project_id, p_real_name = _resolve_project(supabase, p_name)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+        except Exception:
+            logger.exception("Supabase error in create_expense project lookup")
+            return json.dumps({"error": "Database error resolving project."})
+
+        try:
+            expense_date = _validate_date(expense_date, "expense_date")
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+
+        try:
+            amount = _validate_non_negative_number(amount, "amount")
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+
+        row = {
+            "project_id":   project_id,
+            "expense_date": expense_date,
+            "category":     str(category).strip(),
+            "amount":       amount,
+            "payment_mode": str(payment_mode).strip()
+        }
+        vendor = args.get("vendor_or_recipient")
+        if vendor:
+            row["vendor_or_recipient"] = str(vendor).strip()
+        notes = args.get("notes")
+        if notes:
+            row["notes"] = str(notes).strip()
+
+        try:
+            res      = supabase.table("expenses").insert(row).execute()
+            inserted = res.data[0] if res.data else row
+            logger.info("[TOOL DEBUG] name=create_expense action=write rows=1 project=%s date=%s amount=%s",
+                        p_real_name, expense_date, amount)
+            return json.dumps({
+                "success": True,
+                "message": f"Expense of {amount} INR ({category}) recorded for '{p_real_name}' on {expense_date}.",
+                "record":  inserted
+            })
+        except Exception:
+            logger.exception("Supabase error inserting expense")
+            return json.dumps({"error": "Database error creating expense."})
+
+    # ── WRITE: create_equipment_log ──────────────────────────────────────────
+    elif name == "create_equipment_log":
+        p_name         = args.get("project_name")
+        log_date       = args.get("log_date")
+        equipment_name = args.get("equipment_name")
+
+        if not p_name:
+            return json.dumps({"error": "project_name is required."})
+        if not log_date:
+            return json.dumps({"error": "log_date is required (YYYY-MM-DD)."})
+        if not equipment_name:
+            return json.dumps({"error": "equipment_name is required."})
+
+        try:
+            project_id, p_real_name = _resolve_project(supabase, p_name)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+        except Exception:
+            logger.exception("Supabase error in create_equipment_log project lookup")
+            return json.dumps({"error": "Database error resolving project."})
+
+        try:
+            log_date = _validate_date(log_date, "log_date")
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+
+        row = {
+            "project_id":     project_id,
+            "log_date":       log_date,
+            "equipment_name": str(equipment_name).strip()
+        }
+        for field in ("hours_operated", "fuel_consumed_liters"):
+            val = args.get(field)
+            if val is not None:
+                try:
+                    row[field] = _validate_non_negative_number(val, field)
+                except ValueError as ve:
+                    return json.dumps({"error": str(ve)})
+        operator = args.get("operator_name")
+        if operator:
+            row["operator_name"] = str(operator).strip()
+        notes = args.get("notes")
+        if notes:
+            row["notes"] = str(notes).strip()
+
+        try:
+            res      = supabase.table("equipment_logs").insert(row).execute()
+            inserted = res.data[0] if res.data else row
+            logger.info("[TOOL DEBUG] name=create_equipment_log action=write rows=1 project=%s date=%s equip=%s",
+                        p_real_name, log_date, equipment_name)
+            return json.dumps({
+                "success": True,
+                "message": f"Equipment log for '{equipment_name}' created for '{p_real_name}' on {log_date}.",
+                "record":  inserted
+            })
+        except Exception:
+            logger.exception("Supabase error inserting equipment log")
+            return json.dumps({"error": "Database error creating equipment log."})
+
+    # ── WRITE: set_project_attribute ─────────────────────────────────────────
+    # Schema: project_attributes(id UUID, project_id UUID REFERENCES projects(id),
+    #         attribute_name TEXT, attribute_type TEXT, attribute_value TEXT, created_at TIMESTAMP)
+    # Attributes belong to PROJECTS, not to DB columns.
+    # No duplicate attributes per project — update if exists, insert if missing.
+    elif name == "set_project_attribute":
+        p_name          = args.get("project_name")
+        attribute_name  = args.get("attribute_name")
+        attribute_value = args.get("attribute_value")
+        attribute_type  = args.get("attribute_type", "text")
+
+        if not p_name:
+            return json.dumps({"error": "project_name is required."})
+        if not attribute_name or not attribute_name.strip():
+            return json.dumps({"error": "attribute_name is required."})
+        if attribute_value is None:
+            return json.dumps({"error": "attribute_value is required."})
+
+        # Sanitise attribute_type
+        if attribute_type not in ("text", "numeric", "date"):
+            attribute_type = "text"
+
+        # Normalise attribute_name to safe snake_case
+        safe_attr_name = re.sub(r"[^\w]", "_", attribute_name.strip().lower())
+        attribute_value_str = str(attribute_value).strip()
+
+        # Validate value matches declared type
+        if attribute_type == "numeric":
+            try:
+                float(attribute_value_str)
+            except ValueError:
+                return json.dumps({
+                    "error": (
+                        f"attribute_value '{attribute_value_str}' is not a valid number "
+                        f"for attribute_type='numeric'."
+                    )
+                })
+        elif attribute_type == "date":
+            try:
+                _validate_date(attribute_value_str, "attribute_value")
+            except ValueError as ve:
+                return json.dumps({"error": str(ve)})
+
+        # Resolve project
+        try:
+            project_id, p_real_name = _resolve_project(supabase, p_name)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
+        except Exception:
+            logger.exception("Supabase error in set_project_attribute project lookup")
+            return json.dumps({"error": "Database error resolving project."})
+
+        # Check for existing attribute (prevents duplicates)
+        try:
+            existing_res = (
+                supabase.table("project_attributes")
+                .select("id, attribute_value")
+                .eq("project_id", project_id)
+                .eq("attribute_name", safe_attr_name)
+                .execute()
+            )
+            existing_rows = existing_res.data or []
+        except Exception:
+            logger.exception("Supabase error checking existing project_attributes")
+            return json.dumps({"error": "Database error checking existing attributes."})
+
+        try:
+            if existing_rows:
+                # UPDATE — no duplicate created
+                existing_id = existing_rows[0]["id"]
+                old_value   = existing_rows[0].get("attribute_value", "")
+                update_res  = (
+                    supabase.table("project_attributes")
+                    .update({
+                        "attribute_value": attribute_value_str,
+                        "attribute_type":  attribute_type
+                    })
+                    .eq("id", existing_id)
+                    .execute()
+                )
+                updated_row = update_res.data[0] if update_res.data else {}
+                action      = "updated"
+                detail      = f"(was '{old_value}', now '{attribute_value_str}')"
+                logger.info(
+                    "[TOOL DEBUG] name=set_project_attribute action=update rows=1 "
+                    "project=%s attr=%s old=%s new=%s",
+                    p_real_name, safe_attr_name, old_value, attribute_value_str
+                )
+            else:
+                # INSERT — new attribute for this project
+                insert_res  = (
+                    supabase.table("project_attributes")
+                    .insert({
+                        "project_id":      project_id,
+                        "attribute_name":  safe_attr_name,
+                        "attribute_type":  attribute_type,
+                        "attribute_value": attribute_value_str
+                    })
+                    .execute()
+                )
+                updated_row = insert_res.data[0] if insert_res.data else {}
+                action      = "created"
+                detail      = f"(value='{attribute_value_str}')"
+                logger.info(
+                    "[TOOL DEBUG] name=set_project_attribute action=insert rows=1 "
+                    "project=%s attr=%s value=%s",
+                    p_real_name, safe_attr_name, attribute_value_str
+                )
+
+            return json.dumps({
+                "success": True,
+                "message": (
+                    f"Attribute '{safe_attr_name}' {action} for project "
+                    f"'{p_real_name}' {detail}."
+                ),
+                "record": updated_row
+            })
+        except Exception:
+            logger.exception("Supabase error upserting project_attributes")
+            return json.dumps({"error": "Database error saving project attribute."})
+
+    # ── Unknown tool ─────────────────────────────────────────────────────────
+    logger.warning("[TOOL DEBUG] name=%s — unknown tool called", name)
+    return json.dumps({"error": f"Unknown tool: '{name}'."})
+
 
 # ---------------------------------------------------------------------------
 # Meta WhatsApp Cloud API — send message
 # ---------------------------------------------------------------------------
 def send_whatsapp_message(to, message):
-    """Send a text message via Meta WhatsApp Cloud API (Graph API v21.0)."""
+    """Send a text message via Meta WhatsApp Cloud API (Graph API)."""
     if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
         raise RuntimeError("META_ACCESS_TOKEN or META_PHONE_NUMBER_ID env var is missing")
 
@@ -328,18 +1004,14 @@ def send_whatsapp_message(to, message):
     }
 
     masked_recipient = str(to)[:4] + "***" if to else "unknown"
-    masked_phone_id = str(META_PHONE_NUMBER_ID)[:4] + "***" if META_PHONE_NUMBER_ID else "unknown"
+    masked_phone_id  = str(META_PHONE_NUMBER_ID)[:4] + "***" if META_PHONE_NUMBER_ID else "unknown"
 
     logger.info("[META] Sending response to: %s", masked_recipient)
-    logger.info("[META] Sending WhatsApp text response")
-    logger.info("[META] phone_number_id = %s", masked_phone_id)
-    logger.info("[META] recipient = %s", masked_recipient)
-    logger.info("[META] message_type = text")
-
+    logger.info("[META] phone_number_id=%s message_type=text", masked_phone_id)
     logger.info("[PIPELINE] Meta HTTP POST to graph.facebook.com (timeout=30s)")
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
 
-    print("[PIPELINE] Meta response body:", response.text)
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    print("[PIPELINE] Meta response body:", response.text, flush=True)
     logger.info("[PIPELINE] Meta send-message response: HTTP %s", response.status_code)
 
     if not response.ok:
@@ -351,18 +1023,17 @@ def send_whatsapp_message(to, message):
         response.raise_for_status()
 
     try:
-        resp_json = response.json()
+        resp_json     = response.json()
         messages_resp = resp_json.get("messages", [])
         if messages_resp and "id" in messages_resp[0]:
-            wamid = messages_resp[0]["id"]
-            logger.info("[META] Message accepted by Meta")
-            logger.info("[META] WhatsApp message ID: %s", wamid)
+            logger.info("[META] WhatsApp message ID: %s", messages_resp[0]["id"])
         else:
             logger.info("[META] Message accepted by Meta, response: %s", response.text)
         return resp_json
     except Exception:
         logger.info("[META] Response body: %s", response.text)
-        return response.json()
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # AI agent processing
@@ -373,8 +1044,9 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     logger.info("[PIPELINE] -- START process_whatsapp_message --")
     logger.info("[PIPELINE] ── START id=%s from=%s*** ──", message_id, str(sender_id)[:4])
 
-    print("[PIPELINE] Extracted message text", flush=True)
-    logger.info("[INPUT DEBUG] text=%s", incoming_msg)
+    # Diagnostic: log model and current message (no private data)
+    logger.info("[LLM DEBUG] model=%s", GROQ_MODEL)
+    logger.info("[LLM DEBUG] current_message=%s", incoming_msg)
     logger.info("[PIPELINE] Extracted message text (len=%d)", len(incoming_msg))
     logger.info("[PIPELINE] Sender ID prefix: %s***", str(sender_id)[:4])
 
@@ -385,14 +1057,14 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         supabase = get_supabase()
         print("[PIPELINE] Stage 1 completed", flush=True)
         logger.info("[PIPELINE] Stage 1 completed — Supabase client OK")
-    except Exception as e:
+    except Exception:
         print("[PIPELINE] Stage 1 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 1 FAILED — could not create Supabase client")
         _send_error_reply(sender_id)
         return False
 
-    # ── Stage 2: CRM history lookup ───────────────────────────────────────────
+    # ── Stage 2: CRM conversation history ────────────────────────────────────
     print("[PIPELINE] Stage 2 starting", flush=True)
     logger.info("[PIPELINE] Stage 2 starting — Starting CRM history lookup")
     try:
@@ -407,51 +1079,60 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         print("[PIPELINE] Stage 2 completed", flush=True)
         raw_history = history_res.data or []
         logger.info("[PIPELINE] Stage 2 completed — CRM lookup completed, rows=%d", len(raw_history))
-    except Exception as e:
+    except Exception:
         print("[PIPELINE] Stage 2 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 2 FAILED — Supabase history fetch error")
         raw_history = []
 
-    # Build clean alternating history list (chronological order)
+    # Build clean alternating history (chronological, skip error/empty rows)
     chronological_history = list(reversed(raw_history))
     cleaned_history = []
     for h in chronological_history:
-        role = h.get("role")
+        role    = h.get("role")
         content = h.get("message_text", "").strip()
         if role in ("user", "assistant") and content:
-            # Avoid consecutive duplicate messages of the same role in history
-            if cleaned_history and cleaned_history[-1]["role"] == role and cleaned_history[-1]["content"] == content:
+            if (cleaned_history
+                    and cleaned_history[-1]["role"] == role
+                    and cleaned_history[-1]["content"] == content):
                 continue
             cleaned_history.append({"role": role, "content": content})
 
-    # If the last item in history is a user message, drop it so it doesn't collide with the current incoming user turn
+    # Drop trailing user turn — the current message is appended fresh below
     if cleaned_history and cleaned_history[-1]["role"] == "user":
         cleaned_history.pop()
 
-    last_role = cleaned_history[-1]["role"] if cleaned_history else "none"
+    last_role        = cleaned_history[-1]["role"] if cleaned_history else "none"
     last_msg_snippet = cleaned_history[-1]["content"][:60] if cleaned_history else "none"
 
-    logger.info("[LLM DEBUG] model=%s", GROQ_MODEL)
-    logger.info("[LLM DEBUG] current_message=%s", incoming_msg)
     logger.info("[LLM DEBUG] history_count=%d", len(cleaned_history))
     logger.info("[LLM DEBUG] history_last_role=%s", last_role)
     logger.info("[LLM DEBUG] history_last_message=%s", last_msg_snippet)
 
-    # Build message list for LLM
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an intelligent construction field ops assistant. Answer queries concisely for WhatsApp output. Use bold formatting where appropriate.\n\n"
-                "CRITICAL GROUNDING RULES:\n"
-                "1. For greetings, pleasantries, or general conversational openers (e.g. 'Hello', 'Hi', 'Hey', 'Help', 'Who are you?'), respond politely and warmly WITHOUT calling any database tools.\n"
-                "2. When the user asks about projects (e.g. 'What are my active projects?', 'List projects', 'ongoing projects'), daily progress, site logs, or expenses, ALWAYS invoke the appropriate database tool to query Supabase.\n"
-                "3. Your final answer MUST be strictly and exclusively grounded in the data returned by the database tools. NEVER invent, assume, or hallucinate project names, locations, metrics, or expenses (e.g., only mention projects returned in the tool response).\n"
-                "4. If a tool returns 0 projects or 0 records, clearly state 'No active projects found.' or 'No records exist.' Never make up fictitious project names or data."
-            )
-        }
-    ]
+    # ── Build message list for LLM ────────────────────────────────────────────
+    # DB Grounding rules (Requirement #3): fresh Supabase data only, no caching,
+    # no hallucination. Greetings MUST NOT trigger DB tools.
+    system_prompt = (
+        "You are an intelligent construction field ops assistant. "
+        "Answer concisely for WhatsApp (short, clear, bold where helpful).\n\n"
+        "CRITICAL GROUNDING RULES:\n"
+        "1. For greetings, pleasantries, or general openers (e.g. 'Hello', 'Hi', 'Hey', "
+        "'Help', 'Who are you?') respond warmly WITHOUT calling any database tool.\n"
+        "2. For ANY query about projects, daily logs, expenses, equipment, or project "
+        "attributes — ALWAYS call the appropriate database tool first. "
+        "NEVER answer from memory or prior context.\n"
+        "3. Your final answer MUST be grounded EXCLUSIVELY in data returned by the "
+        "tool calls in the current conversation turn. "
+        "NEVER invent, assume, cache, reuse, or guess CRM data.\n"
+        "4. If a tool returns 0 rows or an error message, clearly state "
+        "'No records found' or relay the exact error. Never fabricate data.\n"
+        "5. For write operations (create log, expense, equipment log, set attribute): "
+        "extract structured arguments from the user message, call the appropriate "
+        "tool, then confirm success or report the error returned by the tool.\n"
+        "6. NEVER expose <think> reasoning, raw tool JSON, or internal arguments to the user."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
     messages.extend(cleaned_history)
     messages.append({"role": "user", "content": incoming_msg})
     logger.info("[PIPELINE] LLM context built: %d message(s) (incl. system)", len(messages))
@@ -462,16 +1143,16 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     try:
         supabase.table("chat_sessions").insert({
             "whatsapp_number": sender_id,
-            "role": "user",
-            "message_text": incoming_msg
+            "role":            "user",
+            "message_text":    incoming_msg
         }).execute()
         print("[PIPELINE] Stage 3 completed", flush=True)
         logger.info("[PIPELINE] Stage 3 completed — User message persisted OK")
-    except Exception as e:
+    except Exception:
         print("[PIPELINE] Stage 3 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 3 FAILED — Supabase insert user message error")
-        # Non-fatal: continue even if logging to DB fails
+        # Non-fatal: continue even if history logging fails
 
     # ── Stage 4: Groq client init ─────────────────────────────────────────────
     print("[PIPELINE] Stage 4 starting", flush=True)
@@ -480,7 +1161,7 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         groq_client = get_groq()
         print("[PIPELINE] Stage 4 completed", flush=True)
         logger.info("[PIPELINE] Stage 4 completed — Groq client OK")
-    except Exception as e:
+    except Exception:
         print("[PIPELINE] Stage 4 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 4 FAILED — could not create Groq client")
@@ -497,26 +1178,24 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            timeout=25  # seconds — prevents indefinite hang
+            timeout=25
         )
         print("[PIPELINE] Stage 5 completed", flush=True)
         logger.info("[PIPELINE] Stage 5 completed — LLM call completed")
-    except Exception as e:
+    except Exception:
         print("[PIPELINE] Stage 5 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 5 FAILED — Groq first LLM call error")
         _send_error_reply(sender_id)
         return False
 
-    msg_obj = response.choices[0].message
+    msg_obj        = response.choices[0].message
     has_tool_calls = bool(msg_obj.tool_calls)
     logger.info("[TOOL DEBUG] called=%s", str(has_tool_calls).lower())
-    logger.info("[TOOL DEBUG] tool_calls=%s", str(has_tool_calls).lower())
     logger.info("[PIPELINE] Stage 5 — finish_reason=%s tool_calls=%s",
-                response.choices[0].finish_reason,
-                has_tool_calls)
+                response.choices[0].finish_reason, has_tool_calls)
 
-    # ── Stage 6: Tool execution (if requested) ────────────────────────────────
+    # ── Stage 6: Tool execution (if requested by LLM) ────────────────────────
     if has_tool_calls:
         print("[PIPELINE] Stage 6 starting", flush=True)
         logger.info("[PIPELINE] Stage 6 starting")
@@ -524,14 +1203,14 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         logger.info("[PIPELINE] Stage 6 — Tool calls requested: %s", tool_names)
 
         messages.append({
-            "role": "assistant",
-            "content": msg_obj.content,
+            "role":       "assistant",
+            "content":    msg_obj.content,
             "tool_calls": [
                 {
-                    "id": tc.id,
+                    "id":   tc.id,
                     "type": "function",
                     "function": {
-                        "name": tc.function.name,
+                        "name":      tc.function.name,
                         "arguments": tc.function.arguments
                     }
                 }
@@ -544,35 +1223,34 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             try:
                 tool_args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
-                logger.error("[PIPELINE] Stage 6 — JSON decode error on tool args for %s",
-                             tool_name)
+                logger.error("[PIPELINE] Stage 6 — JSON decode error on tool args for %s", tool_name)
                 tool_args = {}
 
             logger.info("[TOOL DEBUG] name=%s", tool_name)
-            logger.info("[TOOL DEBUG] reason=model requested execution for query: %s", incoming_msg[:40])
-            logger.info("[TOOL DEBUG] arguments=%s", tool_args)
+            logger.info("[TOOL DEBUG] arguments_keys=%s", list(tool_args.keys()))
             logger.info("[PIPELINE] Stage 6 — Executing tool: %s", tool_name)
+
             try:
                 tool_output = execute_tool(tool_name, tool_args)
-                logger.info("[PIPELINE] Stage 6 — Tool %s completed, output_len=%d",
+                logger.info("[PIPELINE] Stage 6 — Tool '%s' completed, output_len=%d",
                             tool_name, len(tool_output))
-            except Exception as e:
+            except Exception:
                 print(f"[PIPELINE] Stage 6 tool {tool_name} FAILED", flush=True)
                 traceback.print_exc()
-                logger.exception("[PIPELINE] Stage 6 FAILED — tool %s raised exception",
-                                 tool_name)
+                logger.exception("[PIPELINE] Stage 6 FAILED — tool %s raised exception", tool_name)
                 tool_output = json.dumps({"error": "Tool execution failed."})
 
+            # Pass tool result back to LLM — required before final answer (Requirement #4)
             messages.append({
-                "role": "tool",
+                "role":         "tool",
                 "tool_call_id": tool_call.id,
-                "content": tool_output
+                "content":      tool_output
             })
 
         print("[PIPELINE] Stage 6 completed", flush=True)
         logger.info("[PIPELINE] Stage 6 completed")
 
-        # ── Stage 7: Second LLM call (final answer after tools) ───────────────
+        # ── Stage 7: Second LLM call (final answer grounded in tool results) ─
         print("[PIPELINE] Stage 7 starting", flush=True)
         logger.info("[PIPELINE] Stage 7 starting — Starting second LLM call (after tools)")
         try:
@@ -581,10 +1259,13 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                 messages=messages,
                 timeout=25
             )
-            reply_text = second_response.choices[0].message.content
+            raw_reply  = second_response.choices[0].message.content or ""
+            # Strip any <think>...</think> blocks before sending (Requirement #2)
+            reply_text = sanitize_reply(raw_reply)
             print("[PIPELINE] Stage 7 completed", flush=True)
-            logger.info("[PIPELINE] Stage 7 completed — Second LLM call completed")
-        except Exception as e:
+            logger.info("[PIPELINE] Stage 7 completed — final reply len=%d (raw len=%d)",
+                        len(reply_text), len(raw_reply))
+        except Exception:
             print("[PIPELINE] Stage 7 FAILED", flush=True)
             traceback.print_exc()
             logger.exception("[PIPELINE] Stage 7 FAILED — Groq second LLM call error")
@@ -594,23 +1275,26 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         print("[PIPELINE] Stage 6 starting", flush=True)
         print("[PIPELINE] Stage 6 completed", flush=True)
         logger.info("[PIPELINE] Stage 6 — No tool calls, using direct LLM answer")
-        reply_text = msg_obj.content
+        raw_reply  = msg_obj.content or ""
+        # Strip any <think>...</think> blocks even for direct non-tool answers (Requirement #2)
+        reply_text = sanitize_reply(raw_reply)
+        logger.info("[PIPELINE] Direct reply len=%d (raw len=%d)", len(reply_text), len(raw_reply))
 
     print("[PIPELINE] Generated response", flush=True)
     logger.info("[PIPELINE] Generated response (len=%d chars)", len(reply_text or ""))
 
-    # ── Stage 8: Persist assistant reply ─────────────────────────────────────
+    # ── Stage 8: Persist sanitized assistant reply ───────────────────────────
     print("[PIPELINE] Stage 8 starting", flush=True)
     logger.info("[PIPELINE] Stage 8 starting — Persisting assistant reply to Supabase")
     try:
         supabase.table("chat_sessions").insert({
             "whatsapp_number": sender_id,
-            "role": "assistant",
-            "message_text": reply_text
+            "role":            "assistant",
+            "message_text":    reply_text   # always the sanitized version — no <think> content
         }).execute()
         print("[PIPELINE] Stage 8 completed", flush=True)
         logger.info("[PIPELINE] Stage 8 completed — Assistant reply persisted OK")
-    except Exception as e:
+    except Exception:
         print("[PIPELINE] Stage 8 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 8 FAILED — Supabase insert assistant message error")
@@ -622,8 +1306,8 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     try:
         send_whatsapp_message(sender_id, reply_text)
         print("[PIPELINE] Stage 9 completed", flush=True)
-        logger.info("[PIPELINE] Stage 9 completed ✅")
-    except Exception as e:
+        logger.info("[PIPELINE] Stage 9 completed")
+    except Exception:
         print("[PIPELINE] Stage 9 FAILED", flush=True)
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 9 FAILED — Meta send-message error")
@@ -638,10 +1322,11 @@ def _send_error_reply(sender_id):
     try:
         send_whatsapp_message(
             sender_id,
-            "⚠️ Sorry, I encountered an error processing your request. Please try again."
+            "Sorry, I encountered an error processing your request. Please try again."
         )
     except Exception:
         logger.exception("[PIPELINE] Meta send-message error while sending error reply")
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -681,16 +1366,12 @@ def receive_whatsapp_webhook():
     """
     Receives incoming WhatsApp messages and status events from Meta.
     """
-    # -----------------------------------------------------------------------
-    # DIAGNOSTIC BANNER — appears in Vercel logs for every POST received.
-    # -----------------------------------------------------------------------
     print("=== META WHATSAPP WEBHOOK POST RECEIVED ===", flush=True)
     logger.info("=== META WHATSAPP WEBHOOK POST RECEIVED ===")
     logger.info("[WEBHOOK] POST received")
     logger.info("[WEBHOOK] method=%s path=%s content_type=%s",
                 request.method, request.path, request.content_type)
 
-    # Parse body
     try:
         data = request.get_json(silent=True) or {}
     except Exception:
@@ -704,15 +1385,15 @@ def receive_whatsapp_webhook():
     try:
         for entry in entries:
             for change in entry.get("changes", []):
-                field = change.get("field", "unknown")
-                value = change.get("value", {})
+                field    = change.get("field", "unknown")
+                value    = change.get("value", {})
                 statuses = value.get("statuses", [])
-                msgs = value.get("messages", [])
+                msgs     = value.get("messages", [])
 
                 logger.info("[WEBHOOK] field=%s", field)
                 logger.info("[WEBHOOK] message_event=%s", str(bool(msgs)).lower())
 
-                # Status / delivery / read events — acknowledge and skip
+                # Status/delivery/read events — acknowledge and skip
                 if statuses:
                     for status in statuses:
                         logger.info(
@@ -721,7 +1402,6 @@ def receive_whatsapp_webhook():
                         )
                     continue
 
-                # Incoming messages
                 if not msgs:
                     logger.info("[WEBHOOK] No messages in this change entry, skipping")
                     continue
@@ -731,7 +1411,6 @@ def receive_whatsapp_webhook():
                 sender_id  = msg.get("from", "")
                 msg_type   = msg.get("type", "unknown")
 
-                # Mask sender for safe logging (show first 4 digits only)
                 masked_sender = str(sender_id)[:4] + "***" if sender_id else "unknown"
 
                 logger.info("[WEBHOOK] REAL MESSAGE RECEIVED")
@@ -758,8 +1437,8 @@ def receive_whatsapp_webhook():
                     process_whatsapp_message(sender_id, incoming_msg, message_id)
                     print("[PIPELINE] process_whatsapp_message() RETURNED", flush=True)
                     logger.info("[PIPELINE] process_whatsapp_message() RETURNED")
-                except Exception as e:
-                    print("[PIPELINE] EXCEPTION while calling process_whatsapp_message():", e, flush=True)
+                except Exception:
+                    print("[PIPELINE] EXCEPTION while calling process_whatsapp_message()", flush=True)
                     logger.exception("[PIPELINE] EXCEPTION while calling process_whatsapp_message()")
                     traceback.print_exc()
 
