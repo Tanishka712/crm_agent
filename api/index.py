@@ -29,7 +29,7 @@ META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 
 META_GRAPH_API_VERSION = "v21.0"
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-groq-70b-8192-tool-use-preview")
 
 # Log safe masked configuration
 logger.info(
