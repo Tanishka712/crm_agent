@@ -84,6 +84,40 @@ def sanitize_reply(text):
 
 
 # ---------------------------------------------------------------------------
+# WhatsApp message length handling (Requirement — 4096 char limit)
+# ---------------------------------------------------------------------------
+WHATSAPP_MAX_MESSAGE_LEN = 4096
+
+
+def cap_whatsapp_reply(text):
+    """Ensure text fits WhatsApp's 4096-char limit.
+
+    Tries to truncate at a natural break point (last newline within limit,
+    then last space). Falls back to hard cut if no safe point exists.
+    Returns (text, truncated_flag).
+    """
+    if not text:
+        return text, False
+
+    if len(text) <= WHATSAPP_MAX_MESSAGE_LEN:
+        return text, False
+
+    suffix = "\n\n... (truncated for WhatsApp)"
+    limit = WHATSAPP_MAX_MESSAGE_LEN - len(suffix)
+
+    truncated = text[:limit]
+    nl_pos    = truncated.rfind("\n")
+    space_pos = truncated.rfind(" ")
+
+    if nl_pos > 0:
+        truncated = truncated[:nl_pos]
+    elif space_pos > 0:
+        truncated = truncated[:space_pos]
+
+    return truncated + suffix, True
+
+
+# ---------------------------------------------------------------------------
 # Validation helpers (Requirement #7)
 # ---------------------------------------------------------------------------
 
@@ -1339,6 +1373,12 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 8 FAILED — Supabase insert assistant message error")
         # Non-fatal: still attempt to send the reply
+
+    # ── Stage 8.5: Cap reply to WhatsApp's 4096-character limit ───────────────
+    logger.info("[WHATSAPP] reply_length=%d", len(reply_text))
+    capped_text, was_truncated = cap_whatsapp_reply(reply_text)
+    logger.info("[WHATSAPP] truncated=%s", str(was_truncated).lower())
+    reply_text = capped_text
 
     # ── Stage 9: Send reply via Meta ──────────────────────────────────────────
     print("[PIPELINE] Stage 9 starting", flush=True)
