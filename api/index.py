@@ -1196,7 +1196,11 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         "5. For write operations (create log, expense, equipment log, set attribute): "
         "extract structured arguments from the user message, call the appropriate "
         "tool, then confirm success or report the error returned by the tool.\n"
-        "6. NEVER expose <think> reasoning, raw tool JSON, or internal arguments to the user."
+        "6. NEVER expose <think> reasoning, raw tool JSON, or internal arguments to the user.\n"
+        "7. ONLY use the tools explicitly listed below. NEVER invent or call a tool "
+        "that is not in the provided tools list (e.g. 'search_project_details', or any "
+        "other hallucinated name). If a valid tool exists for the task, use it — "
+        "otherwise answer without calling any tool."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
