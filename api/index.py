@@ -80,7 +80,7 @@ def sanitize_reply(text):
     if not text:
         return ""
     cleaned = _THINK_RE.sub("", text).strip()
-    return cleaned if cleaned else text.strip()
+    return cleaned.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1311,11 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     # ── Stage 9: Send reply via Meta ──────────────────────────────────────────
     print("[PIPELINE] Stage 9 starting", flush=True)
     logger.info("[PIPELINE] Stage 9 starting — Starting Meta send")
+    if not reply_text:
+        logger.warning(
+            "[PIPELINE] Stage 9 — reply_text empty; sending placeholder to avoid Meta 400"
+        )
+        reply_text = "Sorry, no response generated."
     try:
         send_whatsapp_message(sender_id, reply_text)
         print("[PIPELINE] Stage 9 completed", flush=True)
