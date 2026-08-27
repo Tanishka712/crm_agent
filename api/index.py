@@ -1268,6 +1268,10 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
                 timeout=25
             )
             raw_reply  = second_response.choices[0].message.content or ""
+            logger.info(
+                "[LLM DEBUG] Stage 7 raw_reply (first 300 chars)=%s",
+                raw_reply[:300]
+            )
             # Strip any <think>...</think> blocks before sending (Requirement #2)
             reply_text = sanitize_reply(raw_reply)
             print("[PIPELINE] Stage 7 completed", flush=True)
