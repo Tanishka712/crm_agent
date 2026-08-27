@@ -870,6 +870,11 @@ def execute_tool(name, args):
         attribute_value = args.get("attribute_value")
         attribute_type  = args.get("attribute_type", "text")
 
+        logger.info("[WRITE DEBUG] tool=%s", name)
+        logger.info("[WRITE DEBUG] project=%s", p_name)
+        logger.info("[WRITE DEBUG] attribute=%s", attribute_name)
+        logger.info("[WRITE DEBUG] value=%s", attribute_value)
+
         if not p_name:
             return json.dumps({"error": "project_name is required."})
         if not attribute_name or not attribute_name.strip():
@@ -905,6 +910,7 @@ def execute_tool(name, args):
         # Resolve project
         try:
             project_id, p_real_name = _resolve_project(supabase, p_name)
+            logger.info("[WRITE DEBUG] project_id=%s", project_id)
         except ValueError as ve:
             return json.dumps({"error": str(ve)})
         except Exception:
@@ -930,7 +936,7 @@ def execute_tool(name, args):
                 # UPDATE — no duplicate created
                 existing_id = existing_rows[0]["id"]
                 old_value   = existing_rows[0].get("attribute_value", "")
-                update_res  = (
+                write_res   = (
                     supabase.table("project_attributes")
                     .update({
                         "attribute_value": attribute_value_str,
@@ -939,17 +945,11 @@ def execute_tool(name, args):
                     .eq("id", existing_id)
                     .execute()
                 )
-                updated_row = update_res.data[0] if update_res.data else {}
-                action      = "updated"
-                detail      = f"(was '{old_value}', now '{attribute_value_str}')"
-                logger.info(
-                    "[TOOL DEBUG] name=set_project_attribute action=update rows=1 "
-                    "project=%s attr=%s old=%s new=%s",
-                    p_real_name, safe_attr_name, old_value, attribute_value_str
-                )
+                action = "updated"
+                detail = f"(was '{old_value}', now '{attribute_value_str}')"
             else:
                 # INSERT — new attribute for this project
-                insert_res  = (
+                write_res  = (
                     supabase.table("project_attributes")
                     .insert({
                         "project_id":      project_id,
@@ -959,14 +959,41 @@ def execute_tool(name, args):
                     })
                     .execute()
                 )
-                updated_row = insert_res.data[0] if insert_res.data else {}
-                action      = "created"
-                detail      = f"(value='{attribute_value_str}')"
-                logger.info(
-                    "[TOOL DEBUG] name=set_project_attribute action=insert rows=1 "
-                    "project=%s attr=%s value=%s",
-                    p_real_name, safe_attr_name, attribute_value_str
+                action = "created"
+                detail = f"(value='{attribute_value_str}')"
+
+            if not write_res.data:
+                logger.error(
+                    "[WRITE DEBUG] insert_result=error empty_data project=%s attr=%s",
+                    p_real_name, safe_attr_name
                 )
+                return json.dumps({
+                    "error": (
+                        "Write returned no data - insert/update did not persist "
+                        "(possible RLS or constraint issue)."
+                    )
+                })
+
+            logger.info("[WRITE DEBUG] insert_result=success")
+            updated_row = write_res.data[0]
+
+            # Verify by reading back the row we just wrote
+            verify_res = (
+                supabase.table("project_attributes")
+                .select("id")
+                .eq("id", updated_row.get("id"))
+                .execute()
+            )
+            verified = bool(verify_res.data)
+            logger.info("[WRITE DEBUG] verified_in_db=%s", verified)
+
+            if not verified:
+                return json.dumps({
+                    "error": (
+                        "Write reported success but row not found on read-back "
+                        "(transaction aborted or rolled back)."
+                    )
+                })
 
             logger.info("[WRITE DEBUG] supabase_write=true")
             return json.dumps({
@@ -978,6 +1005,7 @@ def execute_tool(name, args):
                 "record": updated_row
             })
         except Exception:
+            logger.info("[WRITE DEBUG] insert_result=error exception")
             logger.info("[WRITE DEBUG] supabase_write=false")
             logger.exception("Supabase error upserting project_attributes")
             return json.dumps({"error": "Database error saving project attribute."})
