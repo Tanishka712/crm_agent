@@ -471,6 +471,8 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 def execute_tool(name, args):
     supabase = get_supabase()
+    logger.info("[WRITE DEBUG] tool_name=%s", name)
+    logger.info("[WRITE DEBUG] tool_arguments=%s", args)
     logger.info("[TOOL DEBUG] called=true name=%s", name)
 
     # ── READ: get_projects ───────────────────────────────────────────────────
@@ -966,6 +968,7 @@ def execute_tool(name, args):
                     p_real_name, safe_attr_name, attribute_value_str
                 )
 
+            logger.info("[WRITE DEBUG] supabase_write=true")
             return json.dumps({
                 "success": True,
                 "message": (
@@ -975,6 +978,7 @@ def execute_tool(name, args):
                 "record": updated_row
             })
         except Exception:
+            logger.info("[WRITE DEBUG] supabase_write=false")
             logger.exception("Supabase error upserting project_attributes")
             return json.dumps({"error": "Database error saving project attribute."})
 
@@ -1042,6 +1046,7 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
     """Run the incoming message through the Groq AI agent and reply via Meta."""
     print("[PIPELINE] -- START process_whatsapp_message --", flush=True)
     logger.info("[PIPELINE] -- START process_whatsapp_message --")
+    logger.info("[WRITE DEBUG] incoming_text=%s", incoming_msg)
     logger.info("[PIPELINE] ── START id=%s from=%s*** ──", message_id, str(sender_id)[:4])
 
     # Diagnostic: log model and current message (no private data)
@@ -1181,9 +1186,11 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
             timeout=25
         )
         print("[PIPELINE] Stage 5 completed", flush=True)
+        logger.info("[WRITE DEBUG] llm_called=true")
         logger.info("[PIPELINE] Stage 5 completed — LLM call completed")
     except Exception:
         print("[PIPELINE] Stage 5 FAILED", flush=True)
+        logger.info("[WRITE DEBUG] llm_called=false")
         traceback.print_exc()
         logger.exception("[PIPELINE] Stage 5 FAILED — Groq first LLM call error")
         _send_error_reply(sender_id)
@@ -1191,6 +1198,7 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
 
     msg_obj        = response.choices[0].message
     has_tool_calls = bool(msg_obj.tool_calls)
+    logger.info("[WRITE DEBUG] tool_called=%s", str(has_tool_calls).lower())
     logger.info("[TOOL DEBUG] called=%s", str(has_tool_calls).lower())
     logger.info("[PIPELINE] Stage 5 — finish_reason=%s tool_calls=%s",
                 response.choices[0].finish_reason, has_tool_calls)
@@ -1368,6 +1376,7 @@ def receive_whatsapp_webhook():
     """
     print("=== META WHATSAPP WEBHOOK POST RECEIVED ===", flush=True)
     logger.info("=== META WHATSAPP WEBHOOK POST RECEIVED ===")
+    logger.info("[WRITE DEBUG] webhook_reached=true")
     logger.info("[WEBHOOK] POST received")
     logger.info("[WEBHOOK] method=%s path=%s content_type=%s",
                 request.method, request.path, request.content_type)
