@@ -1254,13 +1254,27 @@ def process_whatsapp_message(sender_id, incoming_msg, message_id):
         print("[PIPELINE] Stage 5 completed", flush=True)
         logger.info("[WRITE DEBUG] llm_called=true")
         logger.info("[PIPELINE] Stage 5 completed — LLM call completed")
-    except Exception:
-        print("[PIPELINE] Stage 5 FAILED", flush=True)
-        logger.info("[WRITE DEBUG] llm_called=false")
-        traceback.print_exc()
-        logger.exception("[PIPELINE] Stage 5 FAILED — Groq first LLM call error")
-        _send_error_reply(sender_id)
-        return False
+    except Exception as e:
+        if "tool_use_failed" in str(e) or "tool call validation failed" in str(e):
+            logger.warning(
+                "[LLM DEBUG] tool_use_failed — model hallucinated a tool. "
+                "Retrying without tools."
+            )
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                timeout=25
+            )
+            print("[PIPELINE] Stage 5 completed (no-tools retry)", flush=True)
+            logger.info("[WRITE DEBUG] llm_called=true")
+            logger.info("[PIPELINE] Stage 5 completed — LLM call completed (no-tools retry)")
+        else:
+            print("[PIPELINE] Stage 5 FAILED", flush=True)
+            logger.info("[WRITE DEBUG] llm_called=false")
+            traceback.print_exc()
+            logger.exception("[PIPELINE] Stage 5 FAILED — Groq first LLM call error")
+            _send_error_reply(sender_id)
+            return False
 
     msg_obj        = response.choices[0].message
     has_tool_calls = bool(msg_obj.tool_calls)
