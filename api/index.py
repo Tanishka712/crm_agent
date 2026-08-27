@@ -1015,8 +1015,8 @@ def send_whatsapp_message(to, message):
     logger.info("[PIPELINE] Meta HTTP POST to graph.facebook.com (timeout=30s)")
 
     response = requests.post(url, headers=headers, json=payload, timeout=30)
-    print("[PIPELINE] Meta response body:", response.text, flush=True)
-    logger.info("[PIPELINE] Meta send-message response: HTTP %s", response.status_code)
+    logger.info("[META DEBUG] status=%s", response.status_code)
+    logger.info("[META DEBUG] response_body=%s", response.text[:1000])
 
     if not response.ok:
         logger.error(
